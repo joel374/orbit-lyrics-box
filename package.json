@@ -27,7 +27,8 @@
   "main": "./extension.js",
   "scripts": {
     "test": "node --test test/*.test.js",
-    "package": "vsce package"
+    "package": "vsce package",
+    "release": "node scripts/release.js"
   },
   "activationEvents": [
     "onStartupFinished",
@@ -97,7 +98,11 @@
         "orbitLyrics.fontSize": {
           "type": "string",
           "default": "medium",
-          "enum": ["small", "medium", "large"],
+          "enum": [
+            "small",
+            "medium",
+            "large"
+          ],
           "enumDescriptions": [
             "Compact font size for narrow sidebars",
             "Balanced Apple Music style typography",
@@ -108,7 +113,10 @@
         "orbitLyrics.alignment": {
           "type": "string",
           "default": "center",
-          "enum": ["center", "left"],
+          "enum": [
+            "center",
+            "left"
+          ],
           "description": "Text alignment for karaoke lyrics."
         }
       }
@@ -120,6 +128,7 @@
   },
   "license": "MIT",
   "devDependencies": {
-    "@vscode/vsce": "3.6.0"
+    "@vscode/vsce": "3.6.0",
+    "ovsx": "^1.2.0"
   }
 }
