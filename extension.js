@@ -664,6 +664,15 @@ function toViewState(state) {
   return viewState;
 }
 
+function getOrbitConfig() {
+  if (!vscode) return { fontSize: "medium", alignment: "center" };
+  const conf = vscode.workspace.getConfiguration("orbitLyrics");
+  return {
+    fontSize: conf.get("fontSize") || "medium",
+    alignment: conf.get("alignment") || "center"
+  };
+}
+
 class LyricsBoxViewProvider {
   constructor(extensionUri, controller) {
     this._extensionUri = extensionUri;
@@ -673,13 +682,15 @@ class LyricsBoxViewProvider {
 
   _sendCurrent() {
     const snap = this._controller.snapshot;
+    const config = getOrbitConfig();
     if (lastKnownState) {
       this.postMessage({
         type: "state",
         state: toViewState(lastKnownState),
         lyrics: snap.lyrics,
         synced: snap.synced,
-        lyricsStatus: snap.status
+        lyricsStatus: snap.status,
+        config
       });
     } else {
       // Placeholder so the webview is not blank before the first poll completes
@@ -688,9 +699,17 @@ class LyricsBoxViewProvider {
         state: { title: "Loading...", artist: "", status: "Stopped", position: 0, duration: 0 },
         lyrics: [],
         synced: false,
-        lyricsStatus: "loading"
+        lyricsStatus: "loading",
+        config
       });
     }
+  }
+
+  sendConfig() {
+    this.postMessage({
+      type: "config",
+      config: getOrbitConfig()
+    });
   }
 
   resolveWebviewView(webviewView) {
@@ -1138,7 +1157,7 @@ function getWebviewContent() {
     }
 
     .lyric-item {
-      font-size: 13.5px;
+      font-size: var(--lyric-font-size, 13.5px);
       font-weight: 600;
       line-height: 1.42;
       color: rgba(255, 255, 255, 0.35);
@@ -1148,6 +1167,7 @@ function getWebviewContent() {
       transition: color 0.25s ease, font-size 0.25s ease;
       letter-spacing: -0.2px;
       word-break: break-word;
+      text-align: var(--lyric-align, center);
     }
 
     .lyric-item:hover {
@@ -1156,7 +1176,7 @@ function getWebviewContent() {
 
     /* Active line in Apple Music style: crisp pure white, sharp, no fog/blur shadow */
     .lyric-item.active {
-      font-size: 15.5px;
+      font-size: var(--lyric-active-size, 15.5px);
       font-weight: 700;
       line-height: 1.45;
       color: #ffffff;
@@ -1164,6 +1184,7 @@ function getWebviewContent() {
       border: none;
       padding: 6px 8px;
       text-shadow: none;
+      text-align: var(--lyric-align, center);
     }
 
     .lyric-empty-state {
@@ -1533,10 +1554,35 @@ function getWebviewContent() {
       vscode.postMessage({ type: "seek", position: targetSec });
     });
 
+    function applyConfig(cfg) {
+      if (!cfg) return;
+      if (cfg.fontSize === "small") {
+        document.documentElement.style.setProperty("--lyric-font-size", "12px");
+        document.documentElement.style.setProperty("--lyric-active-size", "13.5px");
+      } else if (cfg.fontSize === "large") {
+        document.documentElement.style.setProperty("--lyric-font-size", "15px");
+        document.documentElement.style.setProperty("--lyric-active-size", "17.5px");
+      } else {
+        document.documentElement.style.setProperty("--lyric-font-size", "13.5px");
+        document.documentElement.style.setProperty("--lyric-active-size", "15.5px");
+      }
+
+      if (cfg.alignment === "left") {
+        document.documentElement.style.setProperty("--lyric-align", "left");
+      } else {
+        document.documentElement.style.setProperty("--lyric-align", "center");
+      }
+    }
+
     // Handle messages from Extension Host
     window.addEventListener("message", (event) => {
       const msg = event.data;
-      if (msg.type === "state") {
+      if (msg.config) {
+        applyConfig(msg.config);
+      }
+      if (msg.type === "config") {
+        applyConfig(msg.config);
+      } else if (msg.type === "state") {
         receivedState = true;
         if (typeof msg.synced === "boolean") isSynced = msg.synced;
         if (msg.lyricsStatus) lyricsStatus = msg.lyricsStatus;
@@ -1822,6 +1868,11 @@ function activate(context) {
     vscode.commands.registerCommand("orbit-lyrics.previous", async () => {
       if (lastKnownState && lastKnownState.player) {
         sendPlayerCommand(lastKnownState.player, "Previous");
+      }
+    }),
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("orbitLyrics")) {
+        provider.sendConfig();
       }
     })
   );

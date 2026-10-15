@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="media/icon.png" width="128" height="128" alt="Orbit Lyrics Box Logo" />
+</p>
+
 # Lyrics Box 🎵 (Live Karaoke Subtitle)
 
 > Real-time synced lyrics & subtitle player widget for VS Code and Antigravity IDE. Automatically detects your active media playback (Chromium, Spotify, YouTube, etc.) and synchronizes karaoke lyrics directly inside your editor.
@@ -18,8 +22,18 @@
 - **⏱️ Precision Offset Stepper**: Fine-tune lyric sync timing on the fly (`-0.1s` / `+0.1s` buttons) or click to reset to `0.0s`. Your custom offset is saved automatically.
 - **🎛️ Mini Player Controls**: Play, pause, previous track, next track, and progress bar scrubber right inside the sidebar.
 - **💎 Apple Music-inspired Typography**: Sleek dark aesthetic with crisp fonts, rounded cards, and adaptive layouts for compact and expanded sidebars.
+- **⚙️ Customizable Settings**: Adjust lyric font size (`small`, `medium`, `large`) and alignment (`center`, `left`) directly in VS Code settings.
 
 ---
+
+## ⚙️ Configuration
+
+You can customize Orbit Lyrics Box via **Settings** (`Ctrl+,`):
+
+| Setting | Default | Options | Description |
+|---|---|---|---|
+| `orbitLyrics.fontSize` | `medium` | `small`, `medium`, `large` | Adjust lyric font typography size |
+| `orbitLyrics.alignment` | `center` | `center`, `left` | Text alignment for karaoke lyrics |
 
 ## 🚀 Getting Started
 

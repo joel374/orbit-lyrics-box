@@ -86,6 +86,28 @@
           "group": "navigation"
         }
       ]
+    },
+    "configuration": {
+      "title": "Lyrics Box",
+      "properties": {
+        "orbitLyrics.fontSize": {
+          "type": "string",
+          "default": "medium",
+          "enum": ["small", "medium", "large"],
+          "enumDescriptions": [
+            "Compact font size for narrow sidebars",
+            "Balanced Apple Music style typography",
+            "Prominent large lyrics"
+          ],
+          "description": "Adjust the lyrics typography size."
+        },
+        "orbitLyrics.alignment": {
+          "type": "string",
+          "default": "center",
+          "enum": ["center", "left"],
+          "description": "Text alignment for karaoke lyrics."
+        }
+      }
     }
   },
   "repository": {
