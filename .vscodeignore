@@ -1,0 +1,10 @@
+node_modules/**
+test/**
+*.vsix
+extension.js.*
+*.bak*
+*.bak
+package-lock.json
+.vscodeignore
+
+

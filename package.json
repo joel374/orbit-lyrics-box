@@ -1,0 +1,99 @@
+{
+  "name": "orbit-lyrics-box",
+  "displayName": "Lyrics Box (Live Karaoke Subtitle)",
+  "description": "Realtime Synced Lyrics & Subtitle Box widget for your music player (Chrome, Spotify, etc.) directly in Antigravity IDE",
+  "version": "1.0.2",
+  "publisher": "joel",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "icon": "media/icon.png",
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "lyrics",
+    "karaoke",
+    "spotify",
+    "music",
+    "subtitle",
+    "mpris",
+    "lrc"
+  ],
+  "main": "./extension.js",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "package": "vsce package"
+  },
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:lyricsBoxExplorer",
+    "onView:lyricsBoxSidebar"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "orbit-lyrics",
+          "title": "Lyrics Box",
+          "icon": "media/music-disc.svg"
+        }
+      ]
+    },
+    "views": {
+      "explorer": [
+        {
+          "type": "webview",
+          "id": "lyricsBoxExplorer",
+          "name": "Lyrics Box"
+        }
+      ],
+      "orbit-lyrics": [
+        {
+          "type": "webview",
+          "id": "lyricsBoxSidebar",
+          "name": "Lyrics Box Subtitle"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "orbit-lyrics.refresh",
+        "title": "Refresh Lyrics",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "orbit-lyrics.playPause",
+        "title": "Play / Pause",
+        "icon": "$(play)"
+      },
+      {
+        "command": "orbit-lyrics.next",
+        "title": "Next Track",
+        "icon": "$(arrow-right)"
+      },
+      {
+        "command": "orbit-lyrics.previous",
+        "title": "Previous Track",
+        "icon": "$(arrow-left)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "orbit-lyrics.refresh",
+          "when": "view == lyricsBoxExplorer || view == lyricsBoxSidebar",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/joel374/orbit-lyrics-box"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@vscode/vsce": "3.6.0"
+  }
+}

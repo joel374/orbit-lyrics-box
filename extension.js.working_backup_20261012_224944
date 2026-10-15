@@ -1,0 +1,1657 @@
+// `vscode` only exists inside the editor's extension host. Unit tests (node --test)
+// load this file outside of it, so the require must not be fatal.
+let vscode = null;
+try {
+  vscode = require("vscode");
+} catch (_) {
+  vscode = null;
+}
+const { execFile } = require("child_process");
+const dns = require("dns");
+
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder("ipv4first");
+}
+
+const USER_AGENT = "AntigravityLyricsBox/1.0.1";
+// A lyrics candidate whose duration differs from the player's by more than this is a different recording.
+const DURATION_TOLERANCE_SEC = 3;
+const FETCH_TIMEOUT_MS = 8000;
+const EXEC_TIMEOUT_MS = 4000;
+const RETRY_AFTER_ERROR_MS = 15000;
+const MAX_RETRY_DELAY_MS = 120000;
+const RETRY_5XX_DELAY_MS = 400;
+const MAX_CACHE_ENTRIES = 300;
+
+// Only successful lookups and definitive "not found" results are cached (never network errors).
+const lyricsCache = new Map();
+let lastKnownState = null;
+let outputChannel = null;
+
+/* ------------------------------------------------------------------ *
+ * Title / artist cleaning
+ * ------------------------------------------------------------------ */
+
+const DASH_SPLIT = /\s+[-–—]\s+/;
+
+// Always removed: pure noise that never appears in a lyrics database entry.
+const NOISE_BRACKET = /\s*[\(\[](?:official\s*(?:music\s*)?video|official\s*audio|official\s*lyric\s*video|(?:lyrics?|audio|lyric)(?:\s*video)?|visuali[sz]er|hd|4k|mv|vorsicht[^\)\]]*)[\)\]]/gi;
+const COVER_BRACKET = /\s*[\(\[][^\)\]]*cover[^\)\]]*[\)\]]/gi;
+// Remaster info never changes the lyrics or the timing, so it is always removed.
+const REMASTER_BRACKET = /\s*[\(\[][^\)\]]*(?<![\p{L}\p{N}])re-?master(?:ed)?(?![\p{L}\p{N}])[^\)\]]*[\)\]]/giu;
+// Version tags (remix, live, ...). Kept for the first lookup, removed for the fallback lookup.
+const VERSION_BRACKET = /\s*[\(\[][^\)\]]*(?<![\p{L}\p{N}])(?:feat\.?|ft\.?|featuring|with|live|acoustic|version|mono|stereo|edit|remix|rmx|mix|dj|instrumental|extended|bootleg|mashup|sped\s*up|slowed|reverb|demo|session)(?![\p{L}\p{N}])[^\)\]]*[\)\]]/giu;
+const TRAILING_FEAT = /\s*[-–]?\s*\b(?:feat\.?|ft\.?|featuring)\b.*$/i;
+// "Title - Remastered 2009", "Title - Official Video": suffixes that carry no useful information.
+const DROPPABLE_SUFFIX = /re-?master|^(?:official|lyrics?|audio|video|visuali[sz]er|hd|4k|mv)\b/i;
+// Decides whether the text after " - " is a version tag (suffix) rather than the real title.
+const TAG_LIKE_SUFFIX = /(?<![\p{L}\p{N}])(?:re-?master(?:ed)?|live|acoustic|edit|remix|rmx|mix|version|mono|stereo|demo|session|instrumental|extended|bootleg|mashup|radio|single|deluxe|bonus|official|lyrics?|audio|video|visuali[sz]er|feat\.?|ft\.?)(?![\p{L}\p{N}])/iu;
+
+function collapseSpaces(str) {
+  return str.replace(/\s{2,}/g, " ").trim();
+}
+
+function cleanArtistName(artist) {
+  return String(artist || "").replace(/\s*VEVO$/i, "").replace(/\s*-\s*Topic$/i, "").trim();
+}
+
+/**
+ * Turns raw player metadata into lookup-ready values.
+ * Returns titleVariants ordered from most to least specific:
+ *   [0] keeps version tags (remix / live / acoustic / feat ...), without remaster or video noise
+ *   [1] the same title with every version tag removed (only used as a duration-checked fallback)
+ */
+function cleanTrackInfo(rawTitle, rawArtist) {
+  const originalTitle = String(rawTitle || "").trim();
+  let title = originalTitle;
+  let artist = String(rawArtist || "").trim();
+  const noisyArtist = !artist || /vevo|topic|various/i.test(artist);
+  artist = cleanArtistName(artist);
+  let artistFromTitle = false;
+  let dashSuffix = "";
+
+  const parts = title.split(DASH_SPLIT);
+  if (parts.length > 1) {
+    const head = parts[0].trim();
+    const rest = parts.slice(1).join(" - ").trim();
+    if (noisyArtist) {
+      // YouTube style: "Artist - Title"
+      artist = head;
+      artistFromTitle = true;
+      title = rest;
+    } else if (artistMatches(head, [artist])) {
+      // "Artist - Title" while the artist is already known
+      title = rest;
+    } else if (TAG_LIKE_SUFFIX.test(rest)) {
+      // "Title - Remastered 2009" / "Title - Live at X": the suffix is a tag, not the title
+      title = head;
+      dashSuffix = rest;
+    } else {
+      // YouTube style "Artist - Title" where the channel name differs from the artist
+      artist = head;
+      artistFromTitle = true;
+      title = rest;
+    }
+  }
+
+  let core = title.replace(NOISE_BRACKET, "").replace(COVER_BRACKET, "").replace(REMASTER_BRACKET, "");
+  core = collapseSpaces(core);
+  if (!core) core = collapseSpaces(originalTitle);
+
+  const keepSuffix = dashSuffix && !DROPPABLE_SUFFIX.test(dashSuffix);
+  const withTags = keepSuffix ? `${core} - ${dashSuffix}` : core;
+  const bare = collapseSpaces(core.replace(VERSION_BRACKET, "").replace(TRAILING_FEAT, "")) || core;
+
+  const titleVariants = [];
+  for (const v of [withTags, bare]) {
+    if (v && !titleVariants.includes(v)) titleVariants.push(v);
+  }
+
+  return { title: titleVariants[0] || "", titleVariants, artist, artistFromTitle };
+}
+
+/* ------------------------------------------------------------------ *
+ * Matching
+ * ------------------------------------------------------------------ */
+
+// Lowercase, strip Latin diacritics, unify "&"/"and" and drop punctuation.
+// Unicode-aware so Japanese / Korean / Cyrillic titles do not collapse to an empty string.
+function normalizeForMatch(str) {
+  return (str || "")
+    .toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // strip Latin diacritics
+    .normalize("NFC") // recompose (e.g. Japanese dakuten, Hangul)
+    .replace(/&/g, " and ")
+    .replace(/[^\p{L}\p{M}\p{N}]+/gu, " ")
+    .trim();
+}
+
+// True if the candidate's artist equals, or contains / is contained by (on word boundaries),
+// any of the wanted artists. Handles "A, B" vs "A".
+function artistMatches(candidateArtist, artists) {
+  const got = normalizeForMatch(candidateArtist);
+  if (!got) return false;
+  for (const artist of artists || []) {
+    const want = normalizeForMatch(artist);
+    if (!want) continue;
+    if (got === want) return true;
+    if ((` ${got} `).includes(` ${want} `) || (` ${want} `).includes(` ${got} `)) return true;
+  }
+  return false;
+}
+
+function isDurationOk(candidateDuration, wantDuration) {
+  if (!wantDuration) return true; // the player gave no duration: nothing to verify against
+  if (typeof candidateDuration !== "number" || !isFinite(candidateDuration)) return false;
+  return Math.abs(candidateDuration - wantDuration) <= DURATION_TOLERANCE_SEC;
+}
+
+/**
+ * Returns acceptable candidates, best first. A candidate must have lyrics, the SAME title,
+ * a matching artist and (when known) a duration within DURATION_TOLERANCE_SEC.
+ * Ranking: closest duration first, then synced lyrics before plain lyrics.
+ */
+function rankCandidates(list, { titles, artists, duration = 0, requireDuration = false }) {
+  if (!Array.isArray(list)) return [];
+  const wantTitles = new Set((titles || []).map(normalizeForMatch).filter(Boolean));
+  if (wantTitles.size === 0) return [];
+  const hasArtist = (artists || []).some(a => normalizeForMatch(a));
+  // Without an artist the title alone is too weak: demand a verified duration.
+  if ((requireDuration || !hasArtist) && !duration) return [];
+
+  return list
+    .filter(c => c && (c.syncedLyrics || c.plainLyrics))
+    .filter(c => wantTitles.has(normalizeForMatch(c.trackName || c.name)))
+    .filter(c => !hasArtist || artistMatches(c.artistName, artists))
+    .filter(c => isDurationOk(c.duration, duration))
+    .map(c => ({
+      c,
+      diff: duration && typeof c.duration === "number" ? Math.round(Math.abs(c.duration - duration)) : 0,
+      synced: c.syncedLyrics ? 1 : 0
+    }))
+    .sort((a, b) => (a.diff - b.diff) || (b.synced - a.synced))
+    .map(x => x.c);
+}
+
+function pickBestCandidate(list, criteria) {
+  return rankCandidates(list, criteria)[0] || null;
+}
+
+/* ------------------------------------------------------------------ *
+ * LRC parsing + LRCLIB lookup
+ * ------------------------------------------------------------------ */
+
+function parseLrc(lrcText) {
+  if (!lrcText) return [];
+  const lines = lrcText.split("\n");
+  const result = [];
+  const timeRegex = /\[(\d+):(\d+(?:\.\d+)?)\](.*)/;
+
+  for (const line of lines) {
+    const match = line.match(timeRegex);
+    if (match) {
+      const minutes = parseInt(match[1], 10);
+      const seconds = parseFloat(match[2]);
+      const text = match[3].trim();
+      if (text) {
+        result.push({
+          time: minutes * 60 + seconds,
+          text: text
+        });
+      }
+    }
+  }
+  return result.sort((a, b) => a.time - b.time);
+}
+
+function candidateToResult(data) {
+  if (data && data.syncedLyrics) {
+    const lines = parseLrc(data.syncedLyrics);
+    if (lines.length) return { lines, synced: true };
+  }
+  if (data && data.plainLyrics) {
+    const lines = data.plainLyrics
+      .split("\n")
+      .map(t => t.trim())
+      .filter(Boolean)
+      .map(text => ({ time: 0, text }));
+    if (lines.length) return { lines, synced: false };
+  }
+  return null;
+}
+
+function firstUsableResult(candidates) {
+  for (const c of candidates) {
+    const result = candidateToResult(c);
+    if (result) return result;
+  }
+  return null;
+}
+
+/**
+ * Tiered, strict lookup. Resolves to { lines, synced } or null (definitively not found).
+ * Rejects on network / server errors so callers can avoid caching them.
+ *
+ *  Tier A/B: title with version tags kept  -> /api/get, then /api/search
+ *  Tier C:   title without version tags    -> same, but the duration MUST match
+ */
+async function lookupLyrics(track, { fetchImpl = fetch } = {}) {
+  const titleVariants = (track && track.titleVariants) || [];
+  const artists = ((track && track.artists) || []).filter(Boolean);
+  const duration = (track && track.duration) || 0;
+  const album = (track && track.album) || "";
+  const primaryArtist = artists[0] || "";
+
+  const getJson = async (endpoint, params) => {
+    const qs = new URLSearchParams(params).toString();
+    const init = { headers: { "User-Agent": USER_AGENT } };
+    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+      init.signal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+    }
+    const url = `https://lrclib.net/api/${endpoint}?${qs}`;
+    let res;
+    // LRCLIB answers 5xx intermittently; retry once before giving up.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      res = await fetchImpl(url, init);
+      if (res.status < 500) break;
+      if (attempt === 0) await new Promise(resolve => setTimeout(resolve, RETRY_5XX_DELAY_MS));
+    }
+    if (res.status === 404) return null; // definitive "not found"
+    if (!res.ok) throw new Error(`LRCLIB ${endpoint} responded ${res.status}`);
+    return res.json();
+  };
+
+  const tryTitle = async (title, { requireDuration, withAlbum }) => {
+    const criteria = { titles: [title], artists, duration, requireDuration };
+
+    // Exact lookup (LRCLIB matches duration within a couple of seconds).
+    if (primaryArtist) {
+      const params = { track_name: title, artist_name: primaryArtist };
+      if (withAlbum && album) params.album_name = album;
+      if (duration) params.duration = String(Math.round(duration));
+      const exact = await getJson("get", params);
+      const hit = firstUsableResult(rankCandidates(exact ? [exact] : [], criteria));
+      if (hit) return hit;
+    }
+
+    // Search: structured query first, then free text.
+    const searches = [];
+    if (primaryArtist) searches.push({ track_name: title, artist_name: primaryArtist });
+    else searches.push({ track_name: title });
+    searches.push({ q: `${title} ${primaryArtist}`.trim() });
+    for (const params of searches) {
+      const list = await getJson("search", params);
+      const hit = firstUsableResult(rankCandidates(list || [], criteria));
+      if (hit) return hit;
+    }
+    return null;
+  };
+
+  for (let i = 0; i < titleVariants.length; i++) {
+    const hit = await tryTitle(titleVariants[i], { requireDuration: i > 0, withAlbum: i === 0 });
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function lyricsCacheKey(track) {
+  const title = (track.titleVariants && track.titleVariants[0]) || "";
+  return [normalizeForMatch(title), normalizeForMatch((track.artists || []).join(" ")), Math.round(track.duration || 0)].join("____");
+}
+
+async function fetchLyricsFromLRCLIB(track, { force = false, fetchImpl } = {}) {
+  const key = lyricsCacheKey(track);
+  if (!force && lyricsCache.has(key)) return lyricsCache.get(key);
+
+  const found = await lookupLyrics(track, { fetchImpl }); // throws on network errors: not cached
+  const result = found || { lines: [], synced: false };
+  if (lyricsCache.size >= MAX_CACHE_ENTRIES) {
+    lyricsCache.delete(lyricsCache.keys().next().value);
+  }
+  lyricsCache.set(key, result);
+  return result;
+}
+
+/* ------------------------------------------------------------------ *
+ * Track-change controller (race-free)
+ * ------------------------------------------------------------------ */
+
+function trackKeyOf(state) {
+  return `${state.rawTitle || ""}____${state.rawArtist || ""}____${Math.round(state.duration || 0)}`;
+}
+
+/**
+ * Owns the lyrics of the CURRENT track. Every fetch carries a generation token; a response
+ * from an older generation (fast skipping A -> B -> C) is discarded, and the lyrics are cleared
+ * the moment the track changes so the previous song's lyrics never sit under a new title.
+ * status: "idle" | "loading" | "found" | "none" | "error"
+ */
+class LyricsController {
+  constructor({ fetchLyrics, onLyrics, log = () => {}, now = Date.now, retryAfterMs = RETRY_AFTER_ERROR_MS }) {
+    this.fetchLyrics = fetchLyrics;
+    this.onLyrics = onLyrics || (() => {});
+    this.log = log;
+    this.now = now;
+    this.retryAfterMs = retryAfterMs;
+    this.generation = 0;
+    this.inflight = false;
+    this.retryAt = 0;
+    this.failures = 0;
+    this.key = null;
+    this.lyrics = [];
+    this.synced = false;
+    this.status = "idle";
+  }
+
+  get snapshot() {
+    return { lyrics: this.lyrics, synced: this.synced, status: this.status };
+  }
+
+  // Called on every poll. Returns the snapshot plus `changed` (true when lyrics were reset / refetched).
+  update(state, { force = false } = {}) {
+    const key = trackKeyOf(state);
+    const trackChanged = key !== this.key;
+
+    if (!state.rawTitle) {
+      if (trackChanged || force) {
+        this.generation++;
+        this.inflight = false;
+        this.key = key;
+        this.lyrics = [];
+        this.synced = false;
+        this.status = "none";
+        return { changed: true, ...this.snapshot };
+      }
+      return { changed: false, ...this.snapshot };
+    }
+
+    const retry = !trackChanged && !force && this.status === "error" && !this.inflight && this.now() >= this.retryAt;
+    if (!trackChanged && !force && !retry) {
+      return { changed: false, ...this.snapshot };
+    }
+
+    if (trackChanged || force) this.failures = 0;
+    this.key = key;
+    this.lyrics = [];
+    this.synced = false;
+    this.status = "loading";
+    this._startFetch(state, force);
+    return { changed: true, ...this.snapshot };
+  }
+
+  _startFetch(state, force) {
+    const gen = ++this.generation;
+    this.inflight = true;
+    this.log(`Fetching lyrics for: ${state.title} - ${state.artist}`);
+
+    let pending;
+    try {
+      pending = Promise.resolve(this.fetchLyrics(state.lookup, { force }));
+    } catch (err) {
+      pending = Promise.reject(err);
+    }
+
+    pending
+      .then(result => {
+        if (gen !== this.generation) return; // a newer track took over: drop this response
+        this.inflight = false;
+        this.lyrics = result.lines;
+        this.synced = !!result.synced;
+        this.status = result.lines.length ? "found" : "none";
+        this.log(`Got ${result.lines.length} lyric lines (synced: ${this.synced})`);
+        this.onLyrics(this.snapshot);
+      })
+      .catch(err => {
+        if (gen !== this.generation) return;
+        this.inflight = false;
+        this.lyrics = [];
+        this.synced = false;
+        this.status = "error";
+        this.retryAt = this.now() + Math.min(this.retryAfterMs * Math.pow(2, this.failures), MAX_RETRY_DELAY_MS);
+        this.failures++;
+        this.log(`Lyrics fetch failed: ${err && err.message}`);
+        this.onLyrics(this.snapshot);
+      });
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * MPRIS (busctl) access and parsing
+ * ------------------------------------------------------------------ */
+
+const PLAYER_NAME_RE = /^org\.mpris\.MediaPlayer2\.[A-Za-z0-9_.\-]+$/;
+
+function isValidPlayerName(name) {
+  return typeof name === "string" && PLAYER_NAME_RE.test(name);
+}
+
+function run(file, args) {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { timeout: EXEC_TIMEOUT_MS, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout || "");
+    });
+  });
+}
+
+function busctlGet(player, property) {
+  return run("busctl", ["--user", "get-property", player, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", property]);
+}
+
+function unescapeBusctl(str) {
+  return str.replace(/\\(x[0-9a-fA-F]{2}|.)/g, (_, c) => {
+    if (c.length === 3) return String.fromCharCode(parseInt(c.slice(1), 16));
+    if (c === "n") return "\n";
+    if (c === "t") return "\t";
+    return c; // \" and \\ and anything else
+  });
+}
+
+// Splits busctl output into quoted strings (unescaped) and bare words.
+function tokenizeBusctl(output) {
+  const tokens = [];
+  const re = /"((?:[^"\\]|\\.)*)"|([^\s"]+)/g;
+  let m;
+  while ((m = re.exec(output || "")) !== null) {
+    if (m[1] !== undefined) tokens.push({ v: unescapeBusctl(m[1]), q: true });
+    else tokens.push({ v: m[2], q: false });
+  }
+  return tokens;
+}
+
+// Parses `busctl get-property ... Metadata` ( a{sv} N "key" type value ... ) into plain fields.
+function parseBusctlMetadata(output) {
+  const out = { title: "", artists: [], album: "", artUrl: "", length: 0 };
+  const tokens = tokenizeBusctl(output);
+  let i = 0;
+  if (tokens[0] && tokens[0].v === "a{sv}") i = 2; // skip type + entry count
+  while (i + 1 < tokens.length) {
+    const key = tokens[i];
+    const type = tokens[i + 1];
+    if (!key.q || type.q) break;
+    i += 2;
+    let value;
+    if (type.v.length > 1 && type.v[0] === "a" && type.v[1] !== "{") {
+      // Array of simple values: `as 2 "A" "B"`
+      const count = parseInt((tokens[i] || {}).v, 10);
+      if (!isFinite(count)) break;
+      i += 1;
+      value = tokens.slice(i, i + count).map(t => t.v);
+      i += count;
+    } else if (type.v.length === 1) {
+      if (i >= tokens.length) break;
+      value = tokens[i].v;
+      i += 1;
+    } else {
+      break; // nested / unsupported type: stop, keep what we have
+    }
+    switch (key.v) {
+      case "xesam:title": if (typeof value === "string") out.title = value; break;
+      case "xesam:artist": if (Array.isArray(value)) out.artists = value.filter(Boolean); break;
+      case "xesam:album": if (typeof value === "string") out.album = value; break;
+      case "mpris:artUrl": if (typeof value === "string") out.artUrl = value; break;
+      case "mpris:length": {
+        const n = parseInt(value, 10);
+        if (isFinite(n)) out.length = n / 1000000;
+        break;
+      }
+      default: break;
+    }
+  }
+  return out;
+}
+
+function parseStringProperty(output) {
+  const m = /\bs\s+"((?:[^"\\]|\\.)*)"/.exec(output || "");
+  return m ? unescapeBusctl(m[1]) : "";
+}
+
+function parseIntegerProperty(output) {
+  const m = /\b[xtiun]\s+(-?\d+)/.exec(output || "");
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+// Builds the player state from the raw busctl outputs (pure, unit-testable).
+function buildPlayerState(player, statusOut, positionOut, metadataOut) {
+  const status = parseStringProperty(statusOut) || "Stopped";
+  const position = parseIntegerProperty(positionOut) / 1000000;
+  const meta = parseBusctlMetadata(metadataOut);
+
+  const rawTitle = meta.title;
+  const rawArtist = meta.artists.join(", ");
+  const cleaned = cleanTrackInfo(rawTitle, meta.artists[0] || "");
+
+  let artists;
+  if (cleaned.artistFromTitle) {
+    artists = [cleaned.artist];
+  } else {
+    artists = [cleaned.artist, ...meta.artists.map(cleanArtistName)];
+  }
+  artists = artists.filter((a, idx) => a && artists.indexOf(a) === idx);
+
+  const displayArtist = cleaned.artistFromTitle
+    ? cleaned.artist
+    : (meta.artists.map(cleanArtistName).filter(Boolean).join(", "));
+
+  return {
+    player,
+    playerName: player.split(".").pop(),
+    status,
+    position,
+    rawTitle,
+    rawArtist,
+    title: cleaned.title || rawTitle || "Unknown Track",
+    artist: displayArtist || "Unknown Artist",
+    artUrl: meta.artUrl,
+    duration: meta.length || 0,
+    album: meta.album || "",
+    lookup: {
+      titleVariants: cleaned.titleVariants,
+      artists,
+      duration: meta.length || 0,
+      album: meta.album || ""
+    }
+  };
+}
+
+async function getActivePlayer() {
+  let listing;
+  try {
+    listing = await run("busctl", ["--user", "list"]);
+  } catch (_) {
+    return null;
+  }
+  const players = [];
+  for (const line of listing.split("\n")) {
+    const match = line.match(/(org\.mpris\.MediaPlayer2\.[^\s]+)/);
+    if (match && isValidPlayerName(match[1]) && !players.includes(match[1])) players.push(match[1]);
+  }
+  if (players.length === 0) return null;
+
+  const statuses = await Promise.all(players.map(p =>
+    busctlGet(p, "PlaybackStatus")
+      .then(out => ({ p, playing: out.includes('"Playing"') }))
+      .catch(() => ({ p, playing: false }))
+  ));
+  return (statuses.find(s => s.playing) || statuses[0]).p;
+}
+
+async function getPlayerState(player) {
+  if (!isValidPlayerName(player)) return null;
+  try {
+    const [statusOut, positionOut, metadataOut] = await Promise.all([
+      busctlGet(player, "PlaybackStatus"),
+      busctlGet(player, "Position").catch(() => ""), // some players do not expose Position
+      busctlGet(player, "Metadata")
+    ]);
+    return buildPlayerState(player, statusOut, positionOut, metadataOut);
+  } catch (_) {
+    return null;
+  }
+}
+
+function sendPlayerCommand(player, command, extraArgs = []) {
+  if (!isValidPlayerName(player)) return;
+  run("busctl", ["--user", "call", player, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", command, ...extraArgs])
+    .catch(err => console.error("[LyricsBox] Command error:", command, err));
+}
+
+/* ------------------------------------------------------------------ *
+ * Webview provider
+ * ------------------------------------------------------------------ */
+
+function toViewState(state) {
+  const { lookup, ...viewState } = state; // the lookup data is host-side only
+  return viewState;
+}
+
+class LyricsBoxViewProvider {
+  constructor(extensionUri, controller) {
+    this._extensionUri = extensionUri;
+    this._controller = controller;
+    this._views = [];
+  }
+
+  _sendCurrent() {
+    const snap = this._controller.snapshot;
+    if (lastKnownState) {
+      this.postMessage({
+        type: "state",
+        state: toViewState(lastKnownState),
+        lyrics: snap.lyrics,
+        synced: snap.synced,
+        lyricsStatus: snap.status
+      });
+    } else {
+      // Placeholder so the webview is not blank before the first poll completes
+      this.postMessage({
+        type: "state",
+        state: { title: "Loading...", artist: "", status: "Stopped", position: 0, duration: 0 },
+        lyrics: [],
+        synced: false,
+        lyricsStatus: "loading"
+      });
+    }
+  }
+
+  resolveWebviewView(webviewView) {
+    // Track all opened webview panels (Explorer + Sidebar)
+    this._views.push(webviewView);
+    webviewView.onDidDispose(() => {
+      this._views = this._views.filter(v => v !== webviewView);
+    }, null, []);
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [this._extensionUri]
+    };
+
+    webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
+
+    // Small delay to ensure webview JS is loaded
+    setTimeout(() => this._sendCurrent(), 200);
+
+    webviewView.webview.onDidReceiveMessage((msg) => {
+      if (!lastKnownState || !lastKnownState.player) return;
+      const player = lastKnownState.player;
+
+      if (msg.type === "playPause") {
+        sendPlayerCommand(player, "PlayPause");
+      } else if (msg.type === "next") {
+        sendPlayerCommand(player, "Next");
+      } else if (msg.type === "previous") {
+        sendPlayerCommand(player, "Previous");
+      } else if (msg.type === "seek") {
+        const offsetMicro = Math.round((Number(msg.position) - (lastKnownState.position || 0)) * 1000000);
+        if (!Number.isFinite(offsetMicro)) return;
+        sendPlayerCommand(player, "Seek", ["x", String(offsetMicro)]);
+      }
+    });
+
+    this._sendCurrent();
+  }
+
+  postMessage(message) {
+    for (const v of this._views) {
+      try { v.webview.postMessage(message); } catch (_) {}
+    }
+  }
+
+  _getHtmlForWebview(webview) {
+    return getWebviewContent();
+  }
+}
+
+function getWebviewContent() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: http: data: blob: vscode-resource: vscode-webview-resource:; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lyrics Box</title>
+  <style>
+    /*
+     * MONOCHROME BENTO THEME
+     * Colors are derived from the editor theme via --vscode-* variables (3b),
+     * so the widget shifts with whatever Antigravity/VS Code theme is active.
+     * Everything is monospace, 1px sharp borders, zero rounded corners.
+     */
+    :root {
+      --mono-fg:      var(--vscode-editor-foreground, #e6e6e6);
+      --mono-bg:      var(--vscode-editor-background, #0d0d0d);
+      --mono-border:  var(--vscode-panel-border, var(--vscode-editorWidget-border, rgba(255,255,255,0.14)));
+      --mono-muted:   var(--vscode-disabledForeground, rgba(230,230,230,0.35));
+      --mono-faint:   rgba(128,128,128,0.28);
+      /* "accent" is just inverse fg/bg for the highlighted lyric block */
+      --mono-inv-bg:  var(--vscode-editor-foreground, #e6e6e6);
+      --mono-inv-fg:  var(--vscode-editor-background, #0d0d0d);
+      --mono-font:    var(--vscode-editor-font-family, var(--vscode-font-family, "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace));
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: var(--mono-font);
+    }
+
+    body {
+      background: transparent;
+      color: var(--mono-fg);
+      padding: 6px;
+      overflow-x: hidden;
+      user-select: none;
+      font-size: 11px;
+      line-height: 1.4;
+    }
+
+    /* The sidebar is a vertical stack of 3 bento boxes. */
+    .container {
+      display: flex;
+      flex-direction: column;
+      height: calc(100vh - 12px);
+      gap: 6px;
+      width: 100%;
+    }
+
+    .bento {
+      border: 1px solid var(--mono-border);
+      background: transparent;
+      position: relative;
+    }
+
+    /* ===== TOP BENTO: COMPACT PLAYER (kept as short as possible) ===== */
+    .player-box {
+      display: flex;
+      align-items: stretch;
+      gap: 0;
+      flex-shrink: 0;
+    }
+
+    .art-cell {
+      width: 36px;
+      height: 36px;
+      flex-shrink: 0;
+      border-right: 1px solid var(--mono-border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      background: var(--mono-faint);
+    }
+
+    /* 36x36 dithered pixel-art look: real art rendered with nearest-neighbor (1a) */
+    #albumArt {
+      width: 36px;
+      height: 36px;
+      object-fit: cover;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      filter: grayscale(1) contrast(1.1);
+      display: none;
+    }
+
+    .art-fallback {
+      font-size: 14px;
+      color: var(--mono-muted);
+    }
+
+    .player-pane {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 3px 6px;
+      gap: 2px;
+    }
+
+    .meta-line {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-size: 10px;
+    }
+
+    .meta-artist {
+      font-weight: 700;
+      text-transform: uppercase;
+      color: var(--mono-fg);
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .meta-sep { color: var(--mono-muted); }
+
+    .meta-title {
+      text-transform: uppercase;
+      color: var(--mono-muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .transport-line {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px 10px;
+      font-size: 10px;
+    }
+
+    .ctrl-group { display: flex; align-items: center; gap: 8px; }
+
+    .ctrl-btn {
+      background: none;
+      border: none;
+      color: var(--mono-fg);
+      cursor: pointer;
+      font-size: 15px;
+      line-height: 1;
+      padding: 4px 5px;
+      opacity: 0.75;
+      transition: opacity 0.12s ease, background 0.12s ease;
+    }
+
+    .ctrl-btn:hover { opacity: 1; background: var(--mono-faint); }
+    .ctrl-btn:active { opacity: 1; }
+
+    .ctrl-play {
+      font-weight: 700;
+      font-size: 16px;
+      border: 1px solid var(--mono-border);
+      padding: 3px 8px;
+    }
+    .ctrl-play:hover { background: var(--mono-faint); }
+
+    /* ASCII progress: 01:42 [==•----] 03:50 */
+    .ascii-progress {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 10px;
+      color: var(--mono-muted);
+      white-space: nowrap;
+      cursor: pointer;
+    }
+
+    #progressAscii {
+      color: var(--mono-fg);
+      letter-spacing: 0.5px;
+    }
+
+    /* ===== MIDDLE BENTO: LYRICS (takes all remaining height) ===== */
+    .lyrics-box {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .lyrics-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 3px 8px;
+      border-bottom: 1px solid var(--mono-border);
+      font-size: 9px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--mono-muted);
+      flex-shrink: 0;
+    }
+
+    .toggle-view-btn {
+      background: none;
+      border: 1px solid var(--mono-border);
+      color: var(--mono-muted);
+      font-family: var(--mono-font);
+      font-size: 9px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      padding: 1px 6px;
+      cursor: pointer;
+      transition: color 0.12s ease, border-color 0.12s ease;
+    }
+
+    .toggle-view-btn:hover { color: var(--mono-fg); border-color: var(--mono-fg); }
+
+    /* The scrolling lyric column, centered vertically */
+    .subtitle-box {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      justify-content: center;
+      text-align: center;
+      padding: 10px 10px;
+      position: relative;
+      overflow: hidden;
+      gap: 7px;
+    }
+
+    /* Gradient fade top & bottom edges */
+    .subtitle-box::before,
+    .subtitle-box::after {
+      content: "";
+      position: absolute;
+      left: 0; right: 0;
+      height: 42px;
+      pointer-events: none;
+      z-index: 2;
+    }
+    .subtitle-box::before {
+      top: 0;
+      background: linear-gradient(to bottom, var(--mono-bg), transparent);
+    }
+    .subtitle-box::after {
+      bottom: 0;
+      background: linear-gradient(to top, var(--mono-bg), transparent);
+    }
+
+    .lyric-line {
+      width: 100%;
+      font-family: var(--mono-font);
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      transition: color 0.2s ease, opacity 0.2s ease;
+      cursor: pointer;
+    }
+
+    /* previous / upcoming lines: low-contrast faded gray */
+    .lyric-prev,
+    .lyric-next {
+      font-size: 11px;
+      color: var(--mono-faint);
+      opacity: 0.55;
+    }
+    .lyric-prev { opacity: 0.4; }
+
+    /* active line: inverse high-contrast block */
+    .lyric-active {
+      font-size: 12.5px;
+      font-weight: 700;
+      color: var(--mono-inv-fg);
+      background: var(--mono-inv-bg);
+      padding: 3px 6px;
+      align-self: center;
+      max-width: 100%;
+      line-height: 1.5;
+    }
+
+    .lyric-empty {
+      font-size: 11px;
+      color: var(--mono-muted);
+    }
+
+    /* FULL LYRICS LIST (toggle) */
+    .full-lyrics-container {
+      display: none;
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 8px 10px;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .full-lyric-item {
+      font-family: var(--mono-font);
+      font-size: 11px;
+      text-transform: uppercase;
+      padding: 2px 4px;
+      cursor: pointer;
+      color: var(--mono-muted);
+      transition: color 0.12s ease, background 0.12s ease;
+    }
+
+    .full-lyric-item:hover { color: var(--mono-fg); }
+
+    .full-lyric-item.current {
+      color: var(--mono-inv-fg);
+      background: var(--mono-inv-bg);
+      font-weight: 700;
+    }
+
+    /* ===== BOTTOM BENTO: STATUS (very thin) ===== */
+    .status-box {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 3px 8px;
+      flex-shrink: 0;
+      font-size: 9px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--mono-muted);
+    }
+
+    .status-link { display: flex; align-items: center; gap: 5px; }
+
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      background: var(--mono-muted);
+      flex-shrink: 0;
+    }
+    .status-dot.playing { background: var(--mono-fg); animation: blink 1.4s steps(1) infinite; }
+    .status-dot.paused  { background: var(--mono-muted); }
+
+    @keyframes blink { 50% { opacity: 0.25; } }
+
+    /* pixelated mini visualizer */
+    .visualizer {
+      display: inline-flex;
+      align-items: flex-end;
+      gap: 1px;
+      height: 9px;
+    }
+    .visualizer span {
+      width: 2px;
+      background: var(--mono-fg);
+      opacity: 0.7;
+      height: 2px;
+      animation: vz 0.9s steps(3) infinite alternate;
+    }
+    .visualizer span:nth-child(2) { animation-delay: 0.1s; }
+    .visualizer span:nth-child(3) { animation-delay: 0.3s; }
+    .visualizer span:nth-child(4) { animation-delay: 0.15s; }
+    .visualizer span:nth-child(5) { animation-delay: 0.4s; }
+    .visualizer span:nth-child(6) { animation-delay: 0.25s; }
+    .visualizer.paused span { animation-play-state: paused; }
+
+    @keyframes vz { 0% { height: 2px; } 100% { height: 9px; } }
+
+    .status-info { color: var(--mono-faint); }
+
+    /* ===== SUBTLE GLASSMORPHISM OVERRIDE =====
+     * Keeps the existing layout and controls intact; only visual styling changes.
+     * Colors stay muted so the lyrics remain the visual focus.
+     */
+    :root {
+      --glass-bg:           color-mix(in srgb, var(--vscode-editor-background, #17191f) 72%, transparent);
+      --glass-bg-strong:    color-mix(in srgb, var(--vscode-editor-background, #17191f) 84%, transparent);
+      --glass-border:       color-mix(in srgb, var(--vscode-editor-foreground, #e7eaf0) 14%, transparent);
+      --glass-highlight:    color-mix(in srgb, var(--vscode-editor-foreground, #e7eaf0) 7%, transparent);
+      --glass-text:         color-mix(in srgb, var(--vscode-editor-foreground, #e7eaf0) 94%, transparent);
+      --glass-muted:        color-mix(in srgb, var(--vscode-editor-foreground, #e7eaf0) 52%, transparent);
+      --glass-faint:        color-mix(in srgb, var(--vscode-editor-foreground, #e7eaf0) 25%, transparent);
+      --glass-accent:       #a9b8d2;
+      --glass-accent-bg:    rgba(137, 158, 197, 0.16);
+      --glass-accent-border: rgba(169, 184, 210, 0.28);
+      --glass-radius:       9px;
+    }
+
+    body {
+      background:
+        radial-gradient(circle at 12% 0%, rgba(137, 158, 197, 0.07), transparent 42%),
+        transparent;
+    }
+
+    .bento {
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: var(--glass-radius);
+      box-shadow:
+        0 8px 24px rgba(0, 0, 0, 0.16),
+        inset 0 1px 0 var(--glass-highlight);
+      backdrop-filter: blur(12px) saturate(108%);
+      -webkit-backdrop-filter: blur(12px) saturate(108%);
+    }
+
+    .art-cell {
+      background: var(--glass-highlight);
+      border-right-color: var(--glass-border);
+    }
+
+    #albumArt {
+      filter: grayscale(0.72) saturate(0.72) contrast(1.04);
+    }
+
+    .meta-artist,
+    #progressAscii,
+    .ctrl-btn {
+      color: var(--glass-text);
+    }
+
+    .meta-title,
+    .meta-sep,
+    .ascii-progress,
+    .status-box,
+    .lyrics-head {
+      color: var(--glass-muted);
+    }
+
+    .ctrl-btn:hover,
+    .ctrl-play:hover {
+      background: var(--glass-highlight);
+    }
+
+    .ctrl-play,
+    .toggle-view-btn {
+      border-color: var(--glass-border);
+    }
+
+    .ctrl-play:hover,
+    .toggle-view-btn:hover {
+      color: var(--glass-text);
+      border-color: var(--glass-accent-border);
+    }
+
+    .lyrics-head {
+      border-bottom-color: var(--glass-border);
+    }
+
+    .subtitle-box::before {
+      background: linear-gradient(to bottom, var(--glass-bg-strong), transparent);
+    }
+
+    .subtitle-box::after {
+      background: linear-gradient(to top, var(--glass-bg-strong), transparent);
+    }
+
+    .lyric-prev,
+    .lyric-next {
+      color: var(--glass-faint);
+    }
+
+    .lyric-active {
+      color: var(--glass-text);
+      background: var(--glass-accent-bg);
+      border: 1px solid var(--glass-accent-border);
+      border-radius: 6px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    }
+
+    .lyric-empty,
+    .full-lyric-item {
+      color: var(--glass-muted);
+    }
+
+    .full-lyric-item:hover {
+      color: var(--glass-text);
+      background: var(--glass-highlight);
+    }
+
+    .full-lyric-item.current {
+      color: var(--glass-text);
+      background: var(--glass-accent-bg);
+      border-left: 2px solid var(--glass-accent);
+    }
+
+    .status-dot.playing,
+    .visualizer span {
+      background: var(--glass-accent);
+    }
+
+    .status-dot.paused,
+    .status-info {
+      background: transparent;
+      color: var(--glass-faint);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+
+    <!-- ===== TOP BENTO: COMPACT PLAYER ===== -->
+    <div class="bento player-box">
+      <div class="art-cell">
+        <img id="albumArt" alt="art" />
+        <span class="art-fallback" id="artFallback">♪</span>
+      </div>
+      <div class="player-pane">
+        <div class="meta-line">
+          <span class="meta-artist" id="trackArtist">—</span>
+          <span class="meta-sep">|</span>
+          <span class="meta-title" id="trackTitle">NO TRACK</span>
+        </div>
+        <div class="transport-line">
+          <div class="ctrl-group">
+            <button class="ctrl-btn" id="prevBtn" title="Previous">⏮</button>
+            <button class="ctrl-btn ctrl-play" id="playPauseBtn" title="Play / Pause">⏸</button>
+            <button class="ctrl-btn" id="nextBtn" title="Next">⏭</button>
+            <button class="ctrl-btn" id="loopBtn" title="Loop" disabled>🔁</button>
+          </div>
+          <div class="ascii-progress" id="progressTrack" title="Seek">
+            <span id="timeCurrent">00:00</span>
+            <span id="progressAscii">[------]</span>
+            <span id="timeTotal">00:00</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- MIDDLE BENTO: LYRICS SYNC -->
+    <div class="bento lyrics-box">
+      <div class="lyrics-head">
+        <span>LYRICS | SYNC</span>
+        <button class="toggle-view-btn" id="toggleViewBtn">FULL</button>
+      </div>
+
+      <div class="subtitle-box" id="subtitleBox">
+        <div class="lyric-line lyric-prev" id="lyricPrev"></div>
+        <div class="lyric-line lyric-active" id="lyricActive">WAITING FOR LYRICS</div>
+        <div class="lyric-line lyric-next" id="lyricNext"></div>
+      </div>
+
+      <div class="full-lyrics-container" id="fullLyricsContainer"></div>
+    </div>
+
+    <!-- ===== BOTTOM BENTO: STATUS ===== -->
+    <div class="bento status-box">
+      <div class="status-link">
+        <div class="status-dot playing" id="statusDot"></div>
+        <span id="playerSource">IDE_LINK | CONNECTED</span>
+      </div>
+      <div class="visualizer" id="eqBars">
+        <span></span><span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <span class="status-info" id="statusInfo">IDLE</span>
+    </div>
+
+  </div>
+
+  <script>
+    const vscode = acquireVsCodeApi();
+
+    let lyrics = [];
+    let currentPosition = 0;
+    let trackDuration = 0;
+    let playbackStatus = "Stopped";
+    let lastTickTime = performance.now();
+    let currentActiveIndex = -1;
+    let showFullLyrics = false;
+    let isSynced = true;
+    let receivedState = false;
+    let lyricsStatus = "loading"; // loading | found | none | error
+    
+    console.log("[WebView] Script loaded, waiting for messages...");
+    console.log("[WebView] acquireVsCodeApi result:", typeof vscode, vscode ? "OK" : "null");
+
+    // DOM Elements
+    const statusDot = document.getElementById("statusDot");
+    const playerSource = document.getElementById("playerSource");
+    const albumArt = document.getElementById("albumArt");
+    const artFallback = document.getElementById("artFallback");
+    const trackTitle = document.getElementById("trackTitle");
+    const trackArtist = document.getElementById("trackArtist");
+    const timeCurrent = document.getElementById("timeCurrent");
+    const timeTotal = document.getElementById("timeTotal");
+    const progressAscii = document.getElementById("progressAscii");
+    const progressTrack = document.getElementById("progressTrack");
+    const lyricPrev = document.getElementById("lyricPrev");
+    const lyricActive = document.getElementById("lyricActive");
+    const lyricNext = document.getElementById("lyricNext");
+    const playPauseBtn = document.getElementById("playPauseBtn");
+    const prevBtn = document.getElementById("prevBtn");
+    const nextBtn = document.getElementById("nextBtn");
+    const eqBars = document.getElementById("eqBars");
+    const statusInfo = document.getElementById("statusInfo");
+    const toggleViewBtn = document.getElementById("toggleViewBtn");
+    const fullLyricsContainer = document.getElementById("fullLyricsContainer");
+    const subtitleBox = document.getElementById("subtitleBox");
+
+    // Build an ASCII progress bar like [==•----]
+    function renderAsciiProgress(ratio) {
+      const WIDTH = 6;
+      const r = Math.max(0, Math.min(1, ratio || 0));
+      const head = Math.min(WIDTH - 1, Math.floor(r * WIDTH));
+      let bar = "[";
+      for (let i = 0; i < WIDTH; i++) {
+        if (i < head) bar += "=";
+        else if (i === head) bar += "\u2022"; // •
+        else bar += "-";
+      }
+      bar += "]";
+      return bar;
+    }
+
+    function formatTime(sec) {
+      if (!sec || isNaN(sec)) return "0:00";
+      const m = Math.floor(sec / 60);
+      const s = Math.floor(sec % 60);
+      return m + ":" + (s < 10 ? "0" : "") + s;
+    }
+
+    // Controls listeners
+    playPauseBtn.addEventListener("click", () => vscode.postMessage({ type: "playPause" }));
+    prevBtn.addEventListener("click", () => vscode.postMessage({ type: "previous" }));
+    nextBtn.addEventListener("click", () => vscode.postMessage({ type: "next" }));
+
+    toggleViewBtn.addEventListener("click", () => {
+      showFullLyrics = !showFullLyrics;
+      if (showFullLyrics) {
+        subtitleBox.style.display = "none";
+        fullLyricsContainer.style.display = "flex";
+        fullLyricsContainer.style.flexDirection = "column";
+        toggleViewBtn.innerText = "SYNC";
+        renderFullLyricsList();
+      } else {
+        subtitleBox.style.display = "flex";
+        fullLyricsContainer.style.display = "none";
+        toggleViewBtn.innerText = "FULL";
+      }
+    });
+
+    progressTrack.addEventListener("click", (e) => {
+      if (!trackDuration) return;
+      const rect = progressTrack.getBoundingClientRect();
+      const clickRatio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const targetSec = clickRatio * trackDuration;
+      vscode.postMessage({ type: "seek", position: targetSec });
+    });
+
+    // Handle messages from Extension Host
+    window.addEventListener("message", (event) => {
+      console.log("[WebView] ✓ Message event fired!");
+      const msg = event.data;
+      console.log("[WebView] Message type:", msg?.type, "data:", msg);
+      if (msg.type === "state") {
+        receivedState = true;
+        console.log("[WebView] ✓ STATE message received!");
+        console.log("[WebView] State data:", msg.state);
+        if (typeof msg.synced === "boolean") isSynced = msg.synced;
+        if (msg.lyricsStatus) lyricsStatus = msg.lyricsStatus;
+        updateState(msg.state, msg.lyrics);
+      } else if (msg.type === "lyricsLoaded") {
+        console.log("[WebView] ✓ LYRICS message received!");
+        lyrics = msg.lyrics || [];
+        if (typeof msg.synced === "boolean") isSynced = msg.synced;
+        if (msg.lyricsStatus) lyricsStatus = msg.lyricsStatus;
+        currentActiveIndex = -2; // force re-render
+        updateSubtitle(currentPosition);
+        if (showFullLyrics) renderFullLyricsList();
+      } else {
+        console.log("[WebView] ⚠ Unknown message type:", msg?.type);
+      }
+    });
+
+    function updateState(state, newLyrics) {
+      if (!state) return;
+      
+      console.log("[WebView] updateState called:", state.title);
+
+      playbackStatus = state.status || "Stopped";
+      currentPosition = state.position || 0;
+      trackDuration = state.duration || 0;
+      lastTickTime = performance.now();
+
+      if (newLyrics) {
+        lyrics = newLyrics;
+        currentActiveIndex = -2; // lyrics were replaced: force the subtitle box to re-render
+        if (showFullLyrics) renderFullLyricsList();
+      }
+
+      // Update player meta (artist is primary, title secondary — "ARTIST // TITLE")
+      trackTitle.innerText = (state.title || "NO TRACK").toUpperCase();
+      trackArtist.innerText = (state.artist || "—").toUpperCase();
+      console.log("[WebView] Updated UI: title=" + trackTitle.innerText + ", artist=" + trackArtist.innerText);
+      playerSource.innerText = state.status === "Stopped"
+        ? "IDE_LINK // IDLE"
+        : "IDE_LINK // CONNECTED";
+      timeTotal.innerText = formatTime(trackDuration);
+
+      // Album art: real cover rendered pixelated (1a), fallback glyph if none
+      if (state.artUrl) {
+        albumArt.src = state.artUrl;
+        albumArt.style.display = "block";
+        artFallback.style.display = "none";
+      } else {
+        albumArt.style.display = "none";
+        albumArt.removeAttribute("src");
+        artFallback.style.display = "block";
+      }
+
+      // Status Indicator & visualizer
+      if (playbackStatus === "Playing") {
+        statusDot.className = "status-dot playing";
+        eqBars.classList.remove("paused");
+        statusInfo.innerText = "PLAYING";
+        playPauseBtn.innerText = "⏸";
+      } else {
+        statusDot.className = "status-dot paused";
+        eqBars.classList.add("paused");
+        statusInfo.innerText = (playbackStatus || "PAUSED").toUpperCase();
+        playPauseBtn.innerText = "▶";
+      }
+
+      updateSubtitle(currentPosition);
+    }
+
+    function renderFullLyricsList() {
+      fullLyricsContainer.innerHTML = "";
+      if (!lyrics.length) {
+        fullLyricsContainer.innerHTML = '<div class="lyric-empty">NO LYRICS FOUND</div>';
+        return;
+      }
+
+      lyrics.forEach((item, idx) => {
+        const div = document.createElement("div");
+        div.className = "full-lyric-item" + (idx === currentActiveIndex ? " current" : "");
+        div.innerText = item.text;
+        div.addEventListener("click", () => {
+          vscode.postMessage({ type: "seek", position: item.time });
+        });
+        fullLyricsContainer.appendChild(div);
+      });
+    }
+
+    function updateSubtitle(pos) {
+      if (!lyrics || lyrics.length === 0) {
+        lyricPrev.innerText = "";
+        if (lyricsStatus === "none") {
+          lyricActive.innerText = "NO LYRICS FOUND";
+        } else if (lyricsStatus === "error") {
+          lyricActive.innerText = "LYRICS UNAVAILABLE | RETRYING";
+        } else if (lyricsStatus === "loading") {
+          lyricActive.innerText = "LOADING LYRICS...";
+        } else {
+          lyricActive.innerText = playbackStatus === "Playing" ? "LISTENING..." : "PAUSED";
+        }
+        lyricNext.innerText = "";
+        return;
+      }
+
+      // Unsynced (plain) lyrics: can't follow playback position.
+      // Show a static hint in the subtitle box and surface the full lyrics instead.
+      if (!isSynced) {
+        if (currentActiveIndex !== -3) {
+          currentActiveIndex = -3;
+          lyricPrev.innerText = "";
+          lyricActive.innerText = "PLAIN LYRICS | NOT SYNCED";
+          lyricNext.innerText = "TAP FULL TO READ ALONG";
+          if (showFullLyrics) renderFullLyricsList();
+        }
+        return;
+      }
+
+      // Find active line
+      let activeIdx = -1;
+      for (let i = 0; i < lyrics.length; i++) {
+        if (lyrics[i].time <= pos) {
+          activeIdx = i;
+        } else {
+          break;
+        }
+      }
+
+      if (activeIdx !== currentActiveIndex) {
+        currentActiveIndex = activeIdx;
+
+        if (activeIdx === -1) {
+          lyricPrev.innerText = "";
+          lyricActive.innerText = "• • •";
+          lyricNext.innerText = lyrics[0] ? lyrics[0].text : "";
+        } else {
+          lyricPrev.innerText = activeIdx > 0 ? lyrics[activeIdx - 1].text : "";
+          lyricActive.innerText = lyrics[activeIdx].text;
+          lyricNext.innerText = (activeIdx + 1 < lyrics.length) ? lyrics[activeIdx + 1].text : "";
+        }
+
+        // Auto highlight in full lyrics if open
+        if (showFullLyrics) {
+          const items = fullLyricsContainer.querySelectorAll(".full-lyric-item");
+          items.forEach((el, idx) => {
+            if (idx === activeIdx) {
+              el.classList.add("current");
+              el.scrollIntoView({ behavior: "smooth", block: "center" });
+            } else {
+              el.classList.remove("current");
+            }
+          });
+        }
+      }
+    }
+
+    // 60FPS Smooth Clock Loop
+    function frameLoop(now) {
+      const delta = (now - lastTickTime) / 1000;
+      lastTickTime = now;
+
+      if (playbackStatus === "Playing") {
+        currentPosition += delta;
+        if (trackDuration && currentPosition > trackDuration) {
+          currentPosition = trackDuration;
+        }
+
+        timeCurrent.innerText = formatTime(currentPosition);
+
+        if (trackDuration > 0) {
+          progressAscii.innerText = renderAsciiProgress(currentPosition / trackDuration);
+        }
+
+        updateSubtitle(currentPosition);
+      }
+
+      requestAnimationFrame(frameLoop);
+    }
+
+    requestAnimationFrame(frameLoop);
+
+    // FALLBACK: If no message in 1s, show diagnostic
+    setTimeout(() => {
+      if (!receivedState) {
+        console.warn("[WebView] ⚠ No state message received after 1s - extension may not have started");
+        trackTitle.innerText = "WAITING...";
+        trackArtist.innerText = "No extension data";
+      }
+    }, 1000);
+  </script>
+</body>
+</html>`;
+}
+
+function activate(context) {
+  // Create output channel for debugging
+  outputChannel = vscode.window.createOutputChannel("Lyrics Box");
+  outputChannel.appendLine("[LyricsBox] Extension activated");
+  const log = (message) => outputChannel.appendLine(`[LyricsBox] ${message}`);
+
+  let provider = null;
+  const controller = new LyricsController({
+    fetchLyrics: (lookup, opts) => fetchLyricsFromLRCLIB(lookup, opts),
+    onLyrics: (snap) => {
+      if (!provider) return;
+      provider.postMessage({
+        type: "lyricsLoaded",
+        lyrics: snap.lyrics,
+        synced: snap.synced,
+        lyricsStatus: snap.status
+      });
+    },
+    log
+  });
+  provider = new LyricsBoxViewProvider(context.extensionUri, controller);
+
+  // Register view for both Explorer and Activity Bar
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider("lyricsBoxExplorer", provider),
+    vscode.window.registerWebviewViewProvider("lyricsBoxSidebar", provider)
+  );
+
+  const pushState = (state, result) => {
+    provider.postMessage({
+      type: "state",
+      state: toViewState(state),
+      // Lyrics are only included when they were reset; async results arrive as "lyricsLoaded"
+      lyrics: result.changed ? result.lyrics : undefined,
+      synced: result.synced,
+      lyricsStatus: result.status
+    });
+  };
+
+  // Command palette: re-fetch lyrics for the current track, bypassing the cache
+  context.subscriptions.push(
+    vscode.commands.registerCommand("antigravityLyrics.refresh", async () => {
+      const player = await getActivePlayer();
+      if (!player) return;
+      const state = await getPlayerState(player);
+      if (!state) return;
+      lastKnownState = state;
+      pushState(state, controller.update(state, { force: true }));
+    })
+  );
+
+  // Background polling (every 1s). Ticks never overlap, and lyrics are fetched in the
+  // background so a slow request cannot stall position updates.
+  let ticking = false;
+  let lastLoggedError = "";
+
+  const tick = async () => {
+    if (ticking) return;
+    ticking = true;
+    try {
+      const player = await getActivePlayer();
+      if (!player) {
+        if (lastKnownState && lastKnownState.status !== "Stopped") {
+          lastKnownState.status = "Stopped";
+          provider.postMessage({
+            type: "state",
+            state: toViewState(lastKnownState),
+            synced: controller.synced,
+            lyricsStatus: controller.status
+          });
+        }
+        return;
+      }
+
+      const state = await getPlayerState(player);
+      if (!state) {
+        if (lastLoggedError !== "state") {
+          lastLoggedError = "state";
+          log(`Could not get player state for ${player}`);
+        }
+        return;
+      }
+      lastLoggedError = "";
+
+      lastKnownState = state;
+      pushState(state, controller.update(state));
+    } catch (e) {
+      log(`Loop error: ${e.message}`);
+    } finally {
+      ticking = false;
+    }
+  };
+
+  tick();
+  const interval = setInterval(tick, 1000);
+
+  context.subscriptions.push({
+    dispose: () => clearInterval(interval)
+  });
+}
+
+function deactivate() {}
+
+module.exports = {
+  activate,
+  deactivate,
+  // exported for unit tests
+  cleanTrackInfo,
+  cleanArtistName,
+  normalizeForMatch,
+  artistMatches,
+  isDurationOk,
+  rankCandidates,
+  pickBestCandidate,
+  parseLrc,
+  lookupLyrics,
+  fetchLyricsFromLRCLIB,
+  LyricsController,
+  parseBusctlMetadata,
+  buildPlayerState,
+  isValidPlayerName,
+  getWebviewContent,
+  DURATION_TOLERANCE_SEC
+};
