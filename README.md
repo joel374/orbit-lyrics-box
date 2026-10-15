@@ -9,6 +9,7 @@
 <p align="center">
   <a href="https://marketplace.visualstudio.com/items?itemName=JoelManisali.orbit-lyrics-box"><img src="https://img.shields.io/visual-studio-marketplace/v/JoelManisali.orbit-lyrics-box?style=flat-square&color=blue&label=VS%20Code%20Marketplace" alt="Marketplace Version" /></a>
   <a href="https://marketplace.visualstudio.com/items?itemName=JoelManisali.orbit-lyrics-box"><img src="https://img.shields.io/visual-studio-marketplace/i/JoelManisali.orbit-lyrics-box?style=flat-square&color=success&logo=visual-studio-code" alt="Marketplace Installs" /></a>
+  <a href="https://open-vsx.org/extension/JoelManisali/orbit-lyrics-box"><img src="https://img.shields.io/open-vsx/v/JoelManisali/orbit-lyrics-box?style=flat-square&color=purple&label=Open%20VSX" alt="Open VSX Version" /></a>
   <a href="https://marketplace.visualstudio.com/items?itemName=JoelManisali.orbit-lyrics-box"><img src="https://img.shields.io/visual-studio-marketplace/r/JoelManisali.orbit-lyrics-box?style=flat-square&color=orange" alt="Marketplace Rating" /></a>
   <img src="https://img.shields.io/badge/platform-Linux-orange.svg?style=flat-square" alt="Platform Linux" />
   <img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License MIT" />
