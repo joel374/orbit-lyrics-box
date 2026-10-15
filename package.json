@@ -3,7 +3,7 @@
   "displayName": "Lyrics Box (Live Karaoke Subtitle)",
   "description": "Realtime Synced Lyrics & Subtitle Box widget for your music player (Chrome, Spotify, etc.) directly in Antigravity IDE",
   "version": "1.0.2",
-  "publisher": "joel",
+  "publisher": "JoelManisali",
   "engines": {
     "vscode": "^1.75.0"
   },
