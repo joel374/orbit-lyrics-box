@@ -36,7 +36,7 @@ let outputChannel = null;
 const DASH_SPLIT = /\s+[-–—]\s+/;
 
 // Always removed: pure noise that never appears in a lyrics database entry.
-const NOISE_BRACKET = /\s*[\(\[](?:official(?:\s*(?:music\s*)?video|\s*audio|\s*lyric\s*(?:video)?|\s*visuali[sz]er|\s*clip)?|(?:lyrics?|audio|lyric)(?:\s*video)?|visuali[sz]er|visualiser|hd|4k|mv|hq|clip\s*officiel|video\s*oficial|vorsicht[^\)\]]*)[\)\]]/gi;
+const NOISE_BRACKET = /\s*[\(\[](?:official(?:\s*(?:music\s*)?video|\s*audio|\s*lyric\s*(?:video)?|\s*visuali[sz]er|\s*clip)?|(?:lyrics?|audio|lyric)(?:\s*video)?|visuali[sz]er|visualiser|hd|4k|mv|hq|clip\s*officiel|video\s*oficial|vorsicht|(?:sub|subtitle|lirik|terjemahan|indo|eng|thai|viet|kor|esp|fr)(?:\s*(?:sub|indo|eng|thai|viet|kor|esp|fr|lyrics?|terjemahan))?)[^\)\]]*[\)\]]/gi;
 const COVER_BRACKET = /\s*[\(\[][^\)\]]*cover[^\)\]]*[\)\]]/gi;
 // Remaster info never changes the lyrics or the timing, so it is always removed.
 const REMASTER_BRACKET = /\s*[\(\[][^\)\]]*(?<![\p{L}\p{N}])re-?master(?:ed)?(?![\p{L}\p{N}])[^\)\]]*[\)\]]/giu;
@@ -82,15 +82,21 @@ function cleanTrackInfo(rawTitle, rawArtist) {
   let artistFromTitle = false;
   let dashSuffix = "";
 
-  const parts = title.split(DASH_SPLIT);
+  // Strip noise brackets like [Official Video], [Sub Thai], (Lyric Video) before splitting on dash
+  const preCleaned = collapseSpaces(title.replace(NOISE_BRACKET, "").replace(COVER_BRACKET, "").replace(REMASTER_BRACKET, "")) || title;
+  const parts = preCleaned.split(DASH_SPLIT);
+  let alternative = null;
+
   if (parts.length > 1) {
     const head = parts[0].trim();
     const rest = parts.slice(1).join(" - ").trim();
     if (noisyArtist) {
-      // YouTube style: "Artist - Title"
+      // YouTube style: "Artist - Title" (most common)
       artist = head;
       artistFromTitle = true;
       title = rest;
+      // Fallback alternative if YouTube uploader formatted it as "Title - Artist"
+      alternative = { title: head, artist: rest };
     } else if (artistMatches(head, [artist])) {
       // "Artist - Title" while the artist is already known
       title = rest;
@@ -103,6 +109,7 @@ function cleanTrackInfo(rawTitle, rawArtist) {
       artist = head;
       artistFromTitle = true;
       title = rest;
+      alternative = { title: head, artist: rest };
     }
   }
 
@@ -119,7 +126,16 @@ function cleanTrackInfo(rawTitle, rawArtist) {
     if (v && !titleVariants.includes(v)) titleVariants.push(v);
   }
 
-  return { title: titleVariants[0] || "", titleVariants, artist, artistFromTitle };
+  return {
+    title: titleVariants[0] || "",
+    titleVariants,
+    artist,
+    artistFromTitle,
+    alternative: alternative ? {
+      title: alternative.title,
+      artist: alternative.artist
+    } : null
+  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -303,6 +319,28 @@ async function lookupLyrics(track, { fetchImpl = fetch } = {}) {
     const hit = await tryTitle(titleVariants[i], { requireDuration: i > 0, withAlbum: i === 0 });
     if (hit) return hit;
   }
+
+  // Fallback for YouTube videos formatted as "Title - Artist" instead of "Artist - Title"
+  if (track && track.alternative && track.alternative.title && track.alternative.artist) {
+    const altCriteria = {
+      titles: [track.alternative.title],
+      artists: [track.alternative.artist],
+      duration,
+      requireDuration: false
+    };
+    try {
+      const searches = [
+        { track_name: track.alternative.title, artist_name: track.alternative.artist },
+        { q: `${track.alternative.title} ${track.alternative.artist}`.trim() }
+      ];
+      for (const params of searches) {
+        const list = await getJson("search", params);
+        const hit = firstUsableResult(rankCandidates(list || [], altCriteria));
+        if (hit) return hit;
+      }
+    } catch (_) {}
+  }
+
   return null;
 }
 
@@ -608,7 +646,8 @@ function buildPlayerState(player, statusOut, positionOut, metadataOut) {
       titleVariants: cleaned.titleVariants,
       artists,
       duration: meta.length || 0,
-      album: meta.album || ""
+      album: meta.album || "",
+      alternative: cleaned.alternative
     }
   };
 }
