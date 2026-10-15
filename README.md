@@ -6,9 +6,13 @@
 
 > Real-time synced lyrics & subtitle player widget for VS Code and Antigravity IDE. Automatically detects your active media playback (Chromium, Spotify, YouTube, etc.) and synchronizes karaoke lyrics directly inside your editor.
 
-![Version](https://img.shields.io/badge/version-1.0.2-blue.svg)
-![License](https://img.shields.io/badge/license-MIT-green.svg)
-![Platform](https://img.shields.io/badge/platform-Linux-orange.svg)
+<p align="center">
+  <a href="https://marketplace.visualstudio.com/items?itemName=JoelManisali.orbit-lyrics-box"><img src="https://img.shields.io/visual-studio-marketplace/v/JoelManisali.orbit-lyrics-box?style=flat-square&color=blue&label=VS%20Code%20Marketplace" alt="Marketplace Version" /></a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=JoelManisali.orbit-lyrics-box"><img src="https://img.shields.io/visual-studio-marketplace/i/JoelManisali.orbit-lyrics-box?style=flat-square&color=success&logo=visual-studio-code" alt="Marketplace Installs" /></a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=JoelManisali.orbit-lyrics-box"><img src="https://img.shields.io/visual-studio-marketplace/r/JoelManisali.orbit-lyrics-box?style=flat-square&color=orange" alt="Marketplace Rating" /></a>
+  <img src="https://img.shields.io/badge/platform-Linux-orange.svg?style=flat-square" alt="Platform Linux" />
+  <img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License MIT" />
+</p>
 
 ---
 
