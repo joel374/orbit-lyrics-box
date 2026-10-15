@@ -19,6 +19,23 @@ const ROOT_DIR = path.resolve(__dirname, "..");
 const PKG_PATH = path.join(ROOT_DIR, "package.json");
 const EXT_PATH = path.join(ROOT_DIR, "extension.js");
 const README_PATH = path.join(ROOT_DIR, "README.md");
+const ENV_PATH = path.join(ROOT_DIR, ".env");
+
+// Auto-load .env if present
+if (fs.existsSync(ENV_PATH)) {
+  const envText = fs.readFileSync(ENV_PATH, "utf8");
+  for (const line of envText.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed && !trimmed.startsWith("#")) {
+      const idx = trimmed.indexOf("=");
+      if (idx > 0) {
+        const key = trimmed.slice(0, idx).trim();
+        const val = trimmed.slice(idx + 1).trim().replace(/^['"]|['"]$/g, "");
+        if (!process.env[key]) process.env[key] = val;
+      }
+    }
+  }
+}
 
 function run(cmd, opts = {}) {
   console.log(`\x1b[36m> ${cmd}\x1b[0m`);
