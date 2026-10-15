@@ -62,6 +62,30 @@ function cleanArtistName(artist) {
 }
 
 /**
+ * Checks whether the current media item is an advertisement (e.g. Spotify Ad, YouTube Sponsor/Ad).
+ * If true, lyrics fetch is completely bypassed to prevent unnecessary network requests.
+ */
+function isAdvertisement(title, artist, trackId = "") {
+  const t = String(title || "").trim();
+  const a = String(artist || "").trim();
+  const combined = `${t} ${a}`.toLowerCase();
+
+  if (typeof trackId === "string" && (trackId.includes(":ad:") || trackId.startsWith("spotify:ad"))) {
+    return true;
+  }
+  if (/^advertisement$/i.test(t) || /^advertisement$/i.test(a)) {
+    return true;
+  }
+  if (/^(spotify|ads?)\b/i.test(a) && (!t || /^advertisement\b/i.test(t))) {
+    return true;
+  }
+  if (/\b(?:commercial|promoted|audio\s*ad)\b/i.test(combined)) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Turns raw player metadata into lookup-ready values.
  * Returns titleVariants ordered from most to least specific:
  *   [0] keeps version tags (remix / live / acoustic / feat ...), without remaster or video noise
@@ -402,14 +426,14 @@ class LyricsController {
     const key = trackKeyOf(state);
     const trackChanged = key !== this.key;
 
-    if (!state.rawTitle) {
+    if (!state.rawTitle || state.isAd) {
       if (trackChanged || force) {
         this.generation++;
         this.inflight = false;
         this.key = key;
-        this.lyrics = [];
+        this.lyrics = state.isAd ? [{ time: 0, text: "Advertisement / Sponsor playing..." }] : [];
         this.synced = false;
-        this.status = "none";
+        this.status = state.isAd ? "found" : "none";
         return { changed: true, ...this.snapshot };
       }
       return { changed: false, ...this.snapshot };
@@ -570,6 +594,7 @@ function parseBusctlMetadata(output) {
       case "xesam:title": if (typeof value === "string") out.title = value; break;
       case "xesam:artist": if (Array.isArray(value)) out.artists = value.filter(Boolean); break;
       case "xesam:album": if (typeof value === "string") out.album = value; break;
+      case "mpris:trackid": if (typeof value === "string") out.trackId = value; break;
       case "mpris:artUrl": if (typeof value === "string") out.artUrl = value; break;
       case "mpris:length": {
         const n = parseInt(value, 10);
@@ -626,9 +651,11 @@ function buildPlayerState(player, statusOut, positionOut, metadataOut) {
   }
   artists = artists.filter((a, idx) => a && artists.indexOf(a) === idx);
 
-  const displayArtist = cleaned.artistFromTitle
+  const isAd = isAdvertisement(rawTitle, rawArtist, meta.trackId);
+  const displayTitle = isAd ? "Advertisement" : (cleaned.title || rawTitle || "Unknown Track");
+  const displayArtist = isAd ? "Sponsor / Ad" : (cleaned.artistFromTitle
     ? cleaned.artist
-    : (meta.artists.map(cleanArtistName).filter(Boolean).join(", "));
+    : (meta.artists.map(cleanArtistName).filter(Boolean).join(", ")));
 
   return {
     player,
@@ -637,7 +664,8 @@ function buildPlayerState(player, statusOut, positionOut, metadataOut) {
     position,
     rawTitle,
     rawArtist,
-    title: cleaned.title || rawTitle || "Unknown Track",
+    isAd,
+    title: displayTitle,
     artist: displayArtist || "Unknown Artist",
     artUrl: meta.artUrl,
     duration: meta.length || 0,
@@ -647,7 +675,8 @@ function buildPlayerState(player, statusOut, positionOut, metadataOut) {
       artists,
       duration: meta.length || 0,
       album: meta.album || "",
-      alternative: cleaned.alternative
+      alternative: cleaned.alternative,
+      isAd
     }
   };
 }
@@ -1985,6 +2014,7 @@ module.exports = {
   LyricsController,
   parseBusctlMetadata,
   buildPlayerState,
+  isAdvertisement,
   isValidPlayerName,
   getWebviewContent,
   DURATION_TOLERANCE_SEC
