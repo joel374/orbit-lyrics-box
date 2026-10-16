@@ -14,7 +14,7 @@ if (dns.setDefaultResultOrder) {
   dns.setDefaultResultOrder("ipv4first");
 }
 
-const USER_AGENT = "OrbitLyricsBox/1.0.3";
+const USER_AGENT = "OrbitLyricsBox/1.0.4";
 // A lyrics candidate whose duration differs from the player's by more than this is a different recording.
 const DURATION_TOLERANCE_SEC = 3;
 const FETCH_TIMEOUT_MS = 8000;
@@ -1676,9 +1676,30 @@ function getWebviewContent() {
     function updateState(state, newLyrics) {
       if (!state) return;
 
-      playbackStatus = state.status || "Stopped";
-      currentPosition = state.position || 0;
-      trackDuration = state.duration || 0;
+      // Title & Artist
+      const displayTitle = (state.title || "NO TRACK").replace(/\\'/g, "'").replace(/\\"/g, '"');
+      const displayArtistText = (state.artist || "—").replace(/\\'/g, "'").replace(/\\"/g, '"');
+      const isTrackChange = (displayTitle && trackTitle.innerText !== displayTitle);
+
+      const newStatus = state.status || "Stopped";
+      const newPos = state.position || 0;
+      const newDuration = state.duration || 0;
+
+      playbackStatus = newStatus;
+      trackDuration = newDuration;
+
+      // Clock Smoothing: Prevent host poll clock jitter from pulling position backwards
+      if (isTrackChange || playbackStatus !== "Playing" || Math.abs(newPos - currentPosition) > 1.8) {
+        // Hard sync on track change, seek, pause, or large delta
+        currentPosition = newPos;
+      } else {
+        // During normal continuous playback:
+        // If host poll lags behind smooth frame clock by < 1.8s, don't snap backwards!
+        // If host poll is ahead, accept it.
+        if (newPos > currentPosition) {
+          currentPosition = newPos;
+        }
+      }
       lastTickTime = performance.now();
 
       if (newLyrics) {
@@ -1688,9 +1709,6 @@ function getWebviewContent() {
         if (showFullLyrics) renderFullLyricsList();
       }
 
-      // Title & Artist
-      const displayTitle = (state.title || "NO TRACK").replace(/\\'/g, "'").replace(/\\"/g, '"');
-      const displayArtistText = (state.artist || "—").replace(/\\'/g, "'").replace(/\\"/g, '"');
       trackTitle.innerText = displayTitle;
       trackArtist.innerText = displayArtistText;
       let friendlyName = (state.playerName || "PLAYER").toUpperCase();
