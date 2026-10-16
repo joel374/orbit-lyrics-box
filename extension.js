@@ -786,15 +786,23 @@ class LyricsBoxViewProvider {
     webviewView.onDidDispose(() => {
       this._views = this._views.filter(v => v !== webviewView);
     }, null, []);
+
+    // Prevent destroying webview DOM & state when user switches to Source Control / Git tabs
     webviewView.webview.options = {
       enableScripts: true,
       localResourceRoots: [this._extensionUri]
     };
 
+    webviewView.onDidChangeVisibility(() => {
+      if (webviewView.visible) {
+        this._sendCurrent();
+      }
+    });
+
     webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
 
-    // Small delay to ensure webview JS is loaded
-    setTimeout(() => this._sendCurrent(), 200);
+    // Send current state and cached lyrics immediately when view mounts
+    setTimeout(() => this._sendCurrent(), 100);
 
     webviewView.webview.onDidReceiveMessage((msg) => {
       if (!lastKnownState || !lastKnownState.player) return;
@@ -1729,8 +1737,12 @@ function getWebviewContent() {
       updateActiveLyric(currentPosition);
     }
 
+    let lyricElements = [];
+    let fullLyricElements = [];
+
     function renderLyricsFlow() {
       lyricsFlow.innerHTML = "";
+      lyricElements = [];
       if (!lyrics || !lyrics.length) {
         let msg = "LISTENING FOR TRACK...";
         let icon = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.4"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg>';
@@ -1751,6 +1763,7 @@ function getWebviewContent() {
 
       lyricsBadgeText.innerText = isSynced ? "LIVE SYNC" : "PLAIN";
 
+      const frag = document.createDocumentFragment();
       lyrics.forEach((item, idx) => {
         const div = document.createElement("div");
         div.className = "lyric-item" + (idx === currentActiveIndex ? " active" : "");
@@ -1759,17 +1772,21 @@ function getWebviewContent() {
         div.addEventListener("click", () => {
           vscode.postMessage({ type: "seek", position: item.time });
         });
-        lyricsFlow.appendChild(div);
+        frag.appendChild(div);
+        lyricElements.push(div);
       });
+      lyricsFlow.appendChild(frag);
     }
 
     function renderFullLyricsList() {
       fullLyricsContainer.innerHTML = "";
+      fullLyricElements = [];
       if (!lyrics.length) {
         fullLyricsContainer.innerHTML = '<div class="lyric-empty-state"><div>NO LYRICS FOUND</div></div>';
         return;
       }
 
+      const frag = document.createDocumentFragment();
       lyrics.forEach((item, idx) => {
         const div = document.createElement("div");
         div.className = "full-lyric-line" + (idx === currentActiveIndex ? " active" : "");
@@ -1777,57 +1794,64 @@ function getWebviewContent() {
         div.addEventListener("click", () => {
           vscode.postMessage({ type: "seek", position: item.time });
         });
-        fullLyricsContainer.appendChild(div);
+        frag.appendChild(div);
+        fullLyricElements.push(div);
       });
+      fullLyricsContainer.appendChild(frag);
     }
 
     const BASE_ADVANCE_OFFSET = 0.35;
+
+    // Binary search O(log N) for ultra-fast active lyric lookup at 60-120fps
+    function findActiveLyricIndex(time) {
+      if (!lyrics.length || time < lyrics[0].time) return -1;
+      let low = 0;
+      let high = lyrics.length - 1;
+      let ans = 0;
+      while (low <= high) {
+        const mid = (low + high) >> 1;
+        if (lyrics[mid].time <= time) {
+          ans = mid;
+          low = mid + 1;
+        } else {
+          high = mid - 1;
+        }
+      }
+      return ans;
+    }
 
     function updateActiveLyric(pos) {
       if (!lyrics || !lyrics.length || !isSynced) return;
 
       const effectivePos = pos + BASE_ADVANCE_OFFSET + userOffset;
-
-      // Find current active line
-      let activeIdx = -1;
-      for (let i = 0; i < lyrics.length; i++) {
-        if (lyrics[i].time <= effectivePos) {
-          activeIdx = i;
-        } else {
-          break;
-        }
-      }
+      const activeIdx = findActiveLyricIndex(effectivePos);
 
       if (activeIdx !== currentActiveIndex) {
+        const prevIdx = currentActiveIndex;
         currentActiveIndex = activeIdx;
 
-        // Update live scroll list classes
-        const items = lyricsFlow.querySelectorAll(".lyric-item");
-        items.forEach((el, idx) => {
-          if (idx === activeIdx) {
-            el.classList.add("active");
-            // Only auto-scroll if user has not recently scrolled manually
-            if (Date.now() > userScrollUntil) {
-              el.scrollIntoView({ behavior: "smooth", block: "center" });
-            }
-          } else {
-            el.classList.remove("active");
+        // O(1) DOM class toggle instead of looping every element
+        if (prevIdx >= 0 && lyricElements[prevIdx]) {
+          lyricElements[prevIdx].classList.remove("active");
+        }
+        if (activeIdx >= 0 && lyricElements[activeIdx]) {
+          lyricElements[activeIdx].classList.add("active");
+          if (Date.now() > userScrollUntil) {
+            lyricElements[activeIdx].scrollIntoView({ behavior: "smooth", block: "center" });
           }
-        });
+        }
 
         // Update full lyrics list if active
         if (showFullLyrics) {
-          const fullItems = fullLyricsContainer.querySelectorAll(".full-lyric-line");
-          fullItems.forEach((el, idx) => {
-            if (idx === activeIdx) {
-              el.classList.add("active");
-              if (Date.now() > userScrollUntil) {
-                el.scrollIntoView({ behavior: "smooth", block: "center" });
-              }
-            } else {
-              el.classList.remove("active");
+          if (prevIdx >= 0 && fullLyricElements[prevIdx]) {
+            fullLyricElements[prevIdx].classList.remove("active");
+          }
+          if (activeIdx >= 0 && fullLyricElements[activeIdx]) {
+            fullLyricElements[activeIdx].classList.add("active");
+            if (Date.now() > userScrollUntil) {
+              fullLyricElements[activeIdx].scrollIntoView({ behavior: "smooth", block: "center" });
             }
-          });
+          }
         }
       }
     }
