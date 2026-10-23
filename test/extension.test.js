@@ -6,7 +6,7 @@ const ext = require("../extension.js");
 const {
   cleanTrackInfo, normalizeForMatch, artistMatches, rankCandidates, pickBestCandidate,
   parseLrc, lookupLyrics, fetchLyricsFromLRCLIB, LyricsController, parseBusctlMetadata,
-  buildPlayerState, isValidPlayerName, getWebviewContent
+  buildPlayerState, buildGenericPlayerState, isValidPlayerName, getWebviewContent
 } = ext;
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -222,6 +222,50 @@ test("lookupLyrics: server errors reject instead of returning 'not found'", asyn
   await assert.rejects(lookupLyrics(track(), { fetchImpl: fakeFetch(() => new Error("offline")) }), /offline/);
 });
 
+test("lookupLyrics: falls back to inverted artist and title when primary only has plain lyrics or misses", async () => {
+  const f = fakeFetch((e, p) => {
+    if (e === "get" && p.track_name === "Cup of Joe" && p.artist_name === "Multo") {
+      return cand({ trackName: "Cup of Joe", artistName: "Multo", duration: 240, syncedLyrics: null, plainLyrics: "plain only" });
+    }
+    if (e === "search" && p.track_name === "Multo" && p.artist_name === "Cup of Joe") {
+      return [cand({ trackName: "Multo", artistName: "Cup of Joe", duration: 240, syncedLyrics: "[00:22.76] synced lyrics", plainLyrics: "synced lyrics" })];
+    }
+    return null;
+  });
+
+  const res = await lookupLyrics({
+    titleVariants: ["Cup of Joe"],
+    artists: ["Multo"],
+    duration: 240,
+    album: ""
+  }, { fetchImpl: f });
+
+  assert.ok(res);
+  assert.equal(res.synced, true);
+  assert.equal(res.lines[0].text, "synced lyrics");
+});
+
+test("lookupLyrics: matches candidate track with version tags like (Unreleased) when duration is exact", async () => {
+  const f = fakeFetch((e, p) => {
+    if (e === "get") return null;
+    if (e === "search" && p.track_name === "Where We Are") {
+      return [cand({ trackName: "Where We Are (Unreleased)", artistName: "One Direction", duration: 222, syncedLyrics: "[00:03.99] Remember when", plainLyrics: "Remember when" })];
+    }
+    return null;
+  });
+
+  const res = await lookupLyrics({
+    titleVariants: ["Where We Are"],
+    artists: ["One Direction"],
+    duration: 222,
+    album: ""
+  }, { fetchImpl: f });
+
+  assert.ok(res);
+  assert.equal(res.synced, true);
+  assert.equal(res.lines[0].text, "Remember when");
+});
+
 /* ---------- Task 4: controller ---------- */
 
 const mkState = (title, artist = "Artist", duration = 200) => ({
@@ -405,6 +449,26 @@ test("buildPlayerState: no metadata falls back to display placeholders", () => {
   assert.equal(s.title, "Unknown Track");
   assert.equal(s.artist, "Unknown Artist");
   assert.equal(s.status, "Stopped");
+});
+
+test("buildGenericPlayerState: handles comma-separated artists and formats lookup", () => {
+  const s = buildGenericPlayerState({
+    player: "darwin:spotify",
+    playerName: "spotify",
+    status: "Playing",
+    position: 45.5,
+    duration: 210,
+    rawTitle: "My Universe",
+    rawArtist: "Coldplay, BTS",
+    album: "Music of the Spheres",
+    artUrl: "https://example.com/cover.jpg"
+  });
+  assert.equal(s.title, "My Universe");
+  assert.equal(s.artist, "Coldplay, BTS");
+  assert.deepEqual(s.lookup.artists, ["Coldplay, BTS", "Coldplay", "BTS"]);
+  assert.equal(s.lookup.duration, 210);
+  assert.equal(s.position, 45.5);
+  assert.equal(s.status, "Playing");
 });
 
 test("isValidPlayerName: only well-formed MPRIS names are accepted", () => {

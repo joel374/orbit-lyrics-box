@@ -7,5 +7,5 @@ extension.js.*
 *.bak
 package-lock.json
 .vscodeignore
-
-
+.env*
+.git*

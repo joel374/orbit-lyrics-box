@@ -14,7 +14,7 @@ if (dns.setDefaultResultOrder) {
   dns.setDefaultResultOrder("ipv4first");
 }
 
-const USER_AGENT = "OrbitLyricsBox/1.0.4";
+const USER_AGENT = "OrbitLyricsBox/1.1.0";
 // A lyrics candidate whose duration differs from the player's by more than this is a different recording.
 const DURATION_TOLERANCE_SEC = 3;
 const FETCH_TIMEOUT_MS = 8000;
@@ -41,7 +41,7 @@ const COVER_BRACKET = /\s*[\(\[][^\)\]]*cover[^\)\]]*[\)\]]/gi;
 // Remaster info never changes the lyrics or the timing, so it is always removed.
 const REMASTER_BRACKET = /\s*[\(\[][^\)\]]*(?<![\p{L}\p{N}])re-?master(?:ed)?(?![\p{L}\p{N}])[^\)\]]*[\)\]]/giu;
 // Version tags (remix, live, ...). Kept for the first lookup, removed for the fallback lookup.
-const VERSION_BRACKET = /\s*[\(\[][^\)\]]*(?<![\p{L}\p{N}])(?:feat\.?|ft\.?|featuring|with|live|acoustic|version|mono|stereo|edit|remix|rmx|mix|dj|instrumental|extended|bootleg|mashup|sped\s*up|slowed|reverb|demo|session)(?![\p{L}\p{N}])[^\)\]]*[\)\]]/giu;
+const VERSION_BRACKET = /\s*[\(\[][^\)\]]*(?<![\p{L}\p{N}])(?:feat\.?|ft\.?|featuring|with|live|acoustic|version|mono|stereo|edit|remix|rmx|mix|dj|instrumental|extended|bootleg|mashup|sped\s*up|slowed|reverb|demo|session|unreleased|bonus|deluxe|radio|single|ost|soundtrack)(?![\p{L}\p{N}])[^\)\]]*[\)\]]/giu;
 const TRAILING_FEAT = /\s*[-–]?\s*\b(?:feat\.?|ft\.?|featuring)\b.*$/i;
 // "Title - Remastered 2009", "Title - Official Video": suffixes that carry no useful information.
 const DROPPABLE_SUFFIX = /re-?master|^(?:official|lyrics?|audio|video|visuali[sz]er|hd|4k|mv)\b/i;
@@ -211,9 +211,21 @@ function rankCandidates(list, { titles, artists, duration = 0, requireDuration =
   // Without an artist the title alone is too weak: demand a verified duration.
   if ((requireDuration || !hasArtist) && !duration) return [];
 
+  const candidateTitleMatches = (c) => {
+    const raw = c.trackName || c.name || "";
+    if (wantTitles.has(normalizeForMatch(raw))) return true;
+    // Strip version brackets like "(Unreleased)", "(Acoustic)", "(Live)" from candidate name
+    // only when duration matches closely to prevent false positives
+    const stripped = collapseSpaces(raw.replace(NOISE_BRACKET, "").replace(REMASTER_BRACKET, "").replace(VERSION_BRACKET, "").replace(TRAILING_FEAT, ""));
+    if (stripped && wantTitles.has(normalizeForMatch(stripped)) && isDurationOk(c.duration, duration)) {
+      return true;
+    }
+    return false;
+  };
+
   return list
     .filter(c => c && (c.syncedLyrics || c.plainLyrics))
-    .filter(c => wantTitles.has(normalizeForMatch(c.trackName || c.name)))
+    .filter(candidateTitleMatches)
     .filter(c => !hasArtist || artistMatches(c.artistName, artists))
     .filter(c => isDurationOk(c.duration, duration))
     .map(c => ({
@@ -313,38 +325,56 @@ async function lookupLyrics(track, { fetchImpl = fetch } = {}) {
     return res.json();
   };
 
-  const tryTitle = async (title, { requireDuration, withAlbum }) => {
-    const criteria = { titles: [title], artists, duration, requireDuration };
+  const tryTitle = async (title, { requireDuration, withAlbum }, targetArtists = artists) => {
+    const criteria = { titles: [title], artists: targetArtists, duration, requireDuration };
+    const curPrimary = targetArtists[0] || "";
 
     // Exact lookup (LRCLIB matches duration within a couple of seconds).
-    if (primaryArtist) {
-      const params = { track_name: title, artist_name: primaryArtist };
+    let plainCandidate = null;
+    if (curPrimary) {
+      const params = { track_name: title, artist_name: curPrimary };
       if (withAlbum && album) params.album_name = album;
       if (duration) params.duration = String(Math.round(duration));
       const exact = await getJson("get", params);
       const hit = firstUsableResult(rankCandidates(exact ? [exact] : [], criteria));
-      if (hit) return hit;
+      if (hit) {
+        if (hit.synced) return hit;
+        plainCandidate = hit; // Keep as fallback if search doesn't find synced lyrics
+      }
     }
 
-    // Search: structured query first, then free text.
+    // Search: structured query first, then free text, then track_name alone (with strict rankCandidates filtering).
     const searches = [];
-    if (primaryArtist) searches.push({ track_name: title, artist_name: primaryArtist });
-    else searches.push({ track_name: title });
-    searches.push({ q: `${title} ${primaryArtist}`.trim() });
+    if (curPrimary) {
+      searches.push({ track_name: title, artist_name: curPrimary });
+      searches.push({ q: `${title} ${curPrimary}`.trim() });
+    }
+    // Also search by track_name alone so artist name variations (e.g. "Adele Adkins" vs "Adele")
+    // can be matched and verified via rankCandidates (which checks artistMatches and duration).
+    searches.push({ track_name: title });
+
     for (const params of searches) {
       const list = await getJson("search", params);
       const hit = firstUsableResult(rankCandidates(list || [], criteria));
-      if (hit) return hit;
+      if (hit) {
+        if (hit.synced) return hit;
+        if (!plainCandidate) plainCandidate = hit;
+      }
     }
-    return null;
+    return plainCandidate;
   };
+
+  let bestHit = null;
 
   for (let i = 0; i < titleVariants.length; i++) {
     const hit = await tryTitle(titleVariants[i], { requireDuration: i > 0, withAlbum: i === 0 });
-    if (hit) return hit;
+    if (hit) {
+      if (hit.synced) return hit;
+      if (!bestHit) bestHit = hit;
+    }
   }
 
-  // Fallback for YouTube videos formatted as "Title - Artist" instead of "Artist - Title"
+  // Fallback 1: YouTube videos formatted as "Title - Artist" instead of "Artist - Title"
   if (track && track.alternative && track.alternative.title && track.alternative.artist) {
     const altCriteria = {
       titles: [track.alternative.title],
@@ -360,12 +390,28 @@ async function lookupLyrics(track, { fetchImpl = fetch } = {}) {
       for (const params of searches) {
         const list = await getJson("search", params);
         const hit = firstUsableResult(rankCandidates(list || [], altCriteria));
-        if (hit) return hit;
+        if (hit) {
+          if (hit.synced) return hit;
+          if (!bestHit) bestHit = hit;
+        }
       }
     } catch (_) {}
   }
 
-  return null;
+  // Fallback 2: Player metadata with inverted Artist and Title (e.g. Title="Cup of Joe", Artist="Multo")
+  // Or when primary search only yielded un-synced plain lyrics while synced lyrics exist under swapped tags.
+  if ((!bestHit || !bestHit.synced) && primaryArtist && titleVariants.length > 0) {
+    const invertedTitle = primaryArtist;
+    const invertedArtists = [titleVariants[0]];
+    try {
+      const invHit = await tryTitle(invertedTitle, { requireDuration: true, withAlbum: false }, invertedArtists);
+      if (invHit && invHit.synced) {
+        return invHit;
+      }
+    } catch (_) {}
+  }
+
+  return bestHit;
 }
 
 function lyricsCacheKey(track) {
@@ -681,7 +727,11 @@ function buildPlayerState(player, statusOut, positionOut, metadataOut) {
   };
 }
 
-async function getActivePlayer() {
+// ------------------------------------------------------------------
+// Platform-specific Adapters (Linux MPRIS, macOS AppleScript, Windows SMTC)
+// ------------------------------------------------------------------
+
+async function getLinuxActivePlayer() {
   let listing;
   try {
     listing = await run("busctl", ["--user", "list"]);
@@ -703,7 +753,7 @@ async function getActivePlayer() {
   return (statuses.find(s => s.playing) || statuses[0]).p;
 }
 
-async function getPlayerState(player) {
+async function getLinuxPlayerState(player) {
   if (!isValidPlayerName(player)) return null;
   try {
     const [statusOut, positionOut, metadataOut] = await Promise.all([
@@ -717,10 +767,282 @@ async function getPlayerState(player) {
   }
 }
 
-function sendPlayerCommand(player, command, extraArgs = []) {
+function sendLinuxPlayerCommand(player, command, extraArgs = []) {
   if (!isValidPlayerName(player)) return;
   run("busctl", ["--user", "call", player, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", command, ...extraArgs])
     .catch(err => console.error("[LyricsBox] Command error:", command, err));
+}
+
+function buildGenericPlayerState({ player, playerName, status, position, duration, rawTitle, rawArtist, album, artUrl }) {
+  const cleaned = cleanTrackInfo(rawTitle, rawArtist);
+  const rawArtistsList = rawArtist ? rawArtist.split(/[,;&]\s*/).map(cleanArtistName).filter(Boolean) : [];
+  let artists;
+  if (cleaned.artistFromTitle) {
+    artists = [cleaned.artist];
+  } else {
+    artists = [cleaned.artist, ...rawArtistsList];
+  }
+  artists = artists.filter((a, idx) => a && artists.indexOf(a) === idx);
+
+  const isAd = isAdvertisement(rawTitle, rawArtist);
+  const displayTitle = isAd ? "Advertisement" : (cleaned.title || rawTitle || "Unknown Track");
+  const displayArtist = isAd ? "Sponsor / Ad" : (cleaned.artist || rawArtist || "Unknown Artist");
+
+  return {
+    player,
+    playerName,
+    status: status || "Stopped",
+    position: typeof position === "number" && isFinite(position) ? position : 0,
+    rawTitle: rawTitle || "",
+    rawArtist: rawArtist || "",
+    isAd,
+    title: displayTitle,
+    artist: displayArtist,
+    artUrl: artUrl || "",
+    duration: typeof duration === "number" && isFinite(duration) ? duration : 0,
+    album: album || "",
+    lookup: {
+      titleVariants: cleaned.titleVariants,
+      artists,
+      duration: typeof duration === "number" && isFinite(duration) ? duration : 0,
+      album: album || "",
+      alternative: cleaned.alternative,
+      isAd
+    }
+  };
+}
+
+// macOS AppleScript Bridge (Spotify & Apple Music)
+async function getDarwinActivePlayer() {
+  const script = `
+    tell application "System Events"
+      set isSpotify to (exists (processes where name is "Spotify"))
+      set isMusic to (exists (processes where name is "Music"))
+    end tell
+    if isSpotify then
+      tell application "Spotify"
+        if player state is playing then return "spotify:playing"
+      end tell
+    end if
+    if isMusic then
+      tell application "Music"
+        if player state is playing then return "music:playing"
+      end tell
+    end if
+    if isSpotify then return "spotify:idle"
+    if isMusic then return "music:idle"
+    return ""
+  `;
+  try {
+    const out = (await run("osascript", ["-e", script])).trim();
+    if (out.startsWith("spotify")) return "darwin:spotify";
+    if (out.startsWith("music")) return "darwin:music";
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function getDarwinPlayerState(player) {
+  const targetApp = player === "darwin:music" ? "Music" : "Spotify";
+  const script = `
+    tell application "${targetApp}"
+      set pState to player state as string
+      set pPos to player position as integer
+      set tName to name of current track
+      set tArtist to artist of current track
+      set tAlbum to album of current track
+      set tDur to (duration of current track) / 1000
+      set artUrl to ""
+      if "${targetApp}" is "Spotify" then
+        try
+          set artUrl to artwork url of current track
+        end try
+      end if
+      return pState & "|||" & pPos & "|||" & tDur & "|||" & tName & "|||" & tArtist & "|||" & tAlbum & "|||" & artUrl
+    end tell
+  `;
+  try {
+    const out = (await run("osascript", ["-e", script])).trim();
+    const parts = out.split("|||");
+    if (parts.length < 5) return null;
+
+    const rawStatus = parts[0].toLowerCase();
+    const status = rawStatus === "playing" ? "Playing" : (rawStatus === "paused" ? "Paused" : "Stopped");
+    const position = parseFloat(parts[1]) || 0;
+    const duration = parseFloat(parts[2]) || 0;
+    const rawTitle = parts[3] || "";
+    const rawArtist = parts[4] || "";
+    const album = parts[5] || "";
+    const artUrl = parts[6] || "";
+
+    return buildGenericPlayerState({
+      player,
+      playerName: targetApp.toLowerCase(),
+      status,
+      position,
+      duration,
+      rawTitle,
+      rawArtist,
+      album,
+      artUrl
+    });
+  } catch (_) {
+    return null;
+  }
+}
+
+function sendDarwinPlayerCommand(player, command, extraArgs = []) {
+  const targetApp = player === "darwin:music" ? "Music" : "Spotify";
+  let appleCmd = "";
+  if (command === "Next") appleCmd = "next track";
+  else if (command === "Previous") appleCmd = "previous track";
+  else if (command === "PlayPause") appleCmd = "playpause";
+  else if (command === "Seek" && extraArgs && extraArgs.length > 0) {
+    const sec = Number(extraArgs[0]);
+    if (Number.isFinite(sec)) appleCmd = `set player position to ${Math.round(sec)}`;
+  }
+
+  if (!appleCmd) return;
+
+  run("osascript", ["-e", `tell application "${targetApp}" to ${appleCmd}`])
+    .catch(err => console.error("[LyricsBox] macOS Command error:", command, err));
+}
+
+// Windows PowerShell Bridge (Windows.Media.Control SMTC)
+async function getWin32ActivePlayer() {
+  const psScript = `
+    [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media,ContentType=WindowsRuntime] | Out-Null
+    $asyncOp = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($asyncOp.Status -eq [Windows.Foundation.AsyncStatus]::Started -and $timer.ElapsedMilliseconds -lt 1500) { Start-Sleep -Milliseconds 20 }
+    $mgr = $asyncOp.GetResults()
+    $session = $mgr.GetCurrentSession()
+    if ($session) {
+      Write-Output $session.SourceAppUserModelId
+    }
+  `;
+  try {
+    const out = (await run("powershell", ["-NoProfile", "-NonInteractive", "-Command", psScript])).trim();
+    return out ? `win32:${out}` : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function getWin32PlayerState(player) {
+  const psScript = `
+    [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media,ContentType=WindowsRuntime] | Out-Null
+    $asyncOp = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($asyncOp.Status -eq [Windows.Foundation.AsyncStatus]::Started -and $timer.ElapsedMilliseconds -lt 1500) { Start-Sleep -Milliseconds 20 }
+    $mgr = $asyncOp.GetResults()
+    $session = $mgr.GetCurrentSession()
+    if (-not $session) { exit }
+
+    $infoAsync = $session.TryGetMediaPropertiesAsync()
+    $timer.Restart()
+    while ($infoAsync.Status -eq [Windows.Foundation.AsyncStatus]::Started -and $timer.ElapsedMilliseconds -lt 1500) { Start-Sleep -Milliseconds 20 }
+    $props = $infoAsync.GetResults()
+
+    $timeline = $session.GetTimelineProperties()
+    $playback = $session.GetPlaybackInfo()
+
+    $status = if ($playback.PlaybackStatus -eq 4) { "Playing" } elseif ($playback.PlaybackStatus -eq 5) { "Paused" } else { "Stopped" }
+    $pos = [math]::Round($timeline.Position.TotalSeconds, 1)
+    $dur = [math]::Round($timeline.EndTime.TotalSeconds, 1)
+
+    $title = if ($props.Title) { $props.Title } else { "" }
+    $artist = if ($props.Artist) { $props.Artist } else { "" }
+    $album = if ($props.AlbumTitle) { $props.AlbumTitle } else { "" }
+
+    Write-Output ($status + "|||" + $pos + "|||" + $dur + "|||" + $title + "|||" + $artist + "|||" + $album)
+  `;
+  try {
+    const out = (await run("powershell", ["-NoProfile", "-NonInteractive", "-Command", psScript])).trim();
+    const parts = out.split("|||");
+    if (parts.length < 5) return null;
+
+    const status = parts[0] || "Stopped";
+    const position = parseFloat(parts[1]) || 0;
+    const duration = parseFloat(parts[2]) || 0;
+    const rawTitle = parts[3] || "";
+    const rawArtist = parts[4] || "";
+    const album = parts[5] || "";
+
+    return buildGenericPlayerState({
+      player,
+      playerName: player.replace("win32:", "").split(".")[0] || "player",
+      status,
+      position,
+      duration,
+      rawTitle,
+      rawArtist,
+      album,
+      artUrl: ""
+    });
+  } catch (_) {
+    return null;
+  }
+}
+
+function sendWin32PlayerCommand(player, command, extraArgs = []) {
+  const methodMap = {
+    PlayPause: "TryTogglePlayPauseAsync()",
+    Next: "TrySkipNextAsync()",
+    Previous: "TrySkipPreviousAsync()"
+  };
+  const callMethod = methodMap[command];
+  if (!callMethod) return;
+  const psScript = `
+    [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media,ContentType=WindowsRuntime] | Out-Null
+    $asyncOp = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($asyncOp.Status -eq [Windows.Foundation.AsyncStatus]::Started -and $timer.ElapsedMilliseconds -lt 1500) { Start-Sleep -Milliseconds 20 }
+    $mgr = $asyncOp.GetResults()
+    $session = $mgr.GetCurrentSession()
+    if ($session) { [void]$session.${callMethod} }
+  `;
+  run("powershell", ["-NoProfile", "-NonInteractive", "-Command", psScript])
+    .catch(err => console.error("[LyricsBox] Windows Command error:", command, err));
+}
+
+// ------------------------------------------------------------------
+// Cross-Platform Dispatcher
+// ------------------------------------------------------------------
+
+async function getActivePlayer() {
+  if (process.platform === "darwin") {
+    return getDarwinActivePlayer();
+  }
+  if (process.platform === "win32") {
+    return getWin32ActivePlayer();
+  }
+  return getLinuxActivePlayer();
+}
+
+async function getPlayerState(player) {
+  if (!player) return null;
+  if (process.platform === "darwin" || player.startsWith("darwin:")) {
+    return getDarwinPlayerState(player);
+  }
+  if (process.platform === "win32" || player.startsWith("win32:")) {
+    return getWin32PlayerState(player);
+  }
+  return getLinuxPlayerState(player);
+}
+
+function sendPlayerCommand(player, command, extraArgs = []) {
+  if (!player) return;
+  if (process.platform === "darwin" || player.startsWith("darwin:")) {
+    sendDarwinPlayerCommand(player, command, extraArgs);
+    return;
+  }
+  if (process.platform === "win32" || player.startsWith("win32:")) {
+    sendWin32PlayerCommand(player, command, extraArgs);
+    return;
+  }
+  sendLinuxPlayerCommand(player, command, extraArgs);
 }
 
 /* ------------------------------------------------------------------ *
@@ -815,9 +1137,14 @@ class LyricsBoxViewProvider {
       } else if (msg.type === "previous") {
         sendPlayerCommand(player, "Previous");
       } else if (msg.type === "seek") {
-        const offsetMicro = Math.round((Number(msg.position) - (lastKnownState.position || 0)) * 1000000);
-        if (!Number.isFinite(offsetMicro)) return;
-        sendPlayerCommand(player, "Seek", ["x", String(offsetMicro)]);
+        const targetSec = Number(msg.position);
+        if (!Number.isFinite(targetSec)) return;
+        const offsetMicro = Math.round((targetSec - (lastKnownState.position || 0)) * 1000000);
+        if (process.platform === "darwin" || player.startsWith("darwin:")) {
+          sendPlayerCommand(player, "Seek", [targetSec]);
+        } else {
+          sendPlayerCommand(player, "Seek", ["x", String(offsetMicro)]);
+        }
       }
     });
 
@@ -1450,10 +1777,10 @@ function getWebviewContent() {
           <span id="lyricsBadgeText">LIVE SYNC</span>
         </div>
         <div class="lyrics-actions">
-          <div class="offset-stepper" title="Sync offset: [−] lambatkan / [+] percepat">
-            <button class="stepper-btn" id="offsetMinusBtn" title="Lambatkan (−0.1s)">−</button>
-            <span class="stepper-val" id="offsetLabel" title="Klik untuk reset (0.0s)">0.0s</span>
-            <button class="stepper-btn" id="offsetPlusBtn" title="Percepat (+0.1s)">+</button>
+          <div class="offset-stepper" title="Sync offset: Klik [-/+] (0.1s), Tahan tombol (cepat), Shift+Klik (1.0s), atau Scroll mouse wheel">
+            <button class="stepper-btn" id="offsetMinusBtn" title="Lambatkan: Klik (-0.1s) / Shift+Klik (-1.0s) / Tahan">−</button>
+            <span class="stepper-val" id="offsetLabel" title="Klik untuk reset (0.0s), atau Scroll mouse wheel">0.0s</span>
+            <button class="stepper-btn" id="offsetPlusBtn" title="Percepat: Klik (+0.1s) / Shift+Klik (+1.0s) / Tahan">+</button>
           </div>
           <button class="toggle-view-btn" id="toggleViewBtn" title="Toggle Full / Live Lyrics">FULL</button>
         </div>
@@ -1556,19 +1883,58 @@ function getWebviewContent() {
 
     updateOffsetDisplay();
 
-    offsetMinusBtn.addEventListener("click", () => {
-      userOffset = Math.round((userOffset - 0.1) * 10) / 10;
+    function changeOffset(delta) {
+      userOffset = Math.round((userOffset + delta) * 10) / 10;
       updateOffsetDisplay();
       currentActiveIndex = -2;
       updateActiveLyric(currentPosition);
-    });
+    }
 
-    offsetPlusBtn.addEventListener("click", () => {
-      userOffset = Math.round((userOffset + 0.1) * 10) / 10;
-      updateOffsetDisplay();
-      currentActiveIndex = -2;
-      updateActiveLyric(currentPosition);
-    });
+    function setupHoldRepeat(btn, getDelta) {
+      let intervalId = null;
+      let timeoutId = null;
+
+      const stop = () => {
+        if (timeoutId) { clearTimeout(timeoutId); timeoutId = null; }
+        if (intervalId) { clearInterval(intervalId); intervalId = null; }
+      };
+
+      btn.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        const delta = getDelta(e);
+        changeOffset(delta);
+        timeoutId = setTimeout(() => {
+          intervalId = setInterval(() => {
+            changeOffset(getDelta(e));
+          }, 85);
+        }, 300);
+      });
+
+      btn.addEventListener("mouseleave", stop);
+      btn.addEventListener("mouseup", stop);
+      btn.addEventListener("touchend", stop);
+
+      // Support keyboard activation (Enter / Space)
+      btn.addEventListener("click", (e) => {
+        if (e.detail === 0) {
+          changeOffset(getDelta(e));
+        }
+      });
+    }
+
+    setupHoldRepeat(offsetMinusBtn, (e) => (e && e.shiftKey ? -1.0 : -0.1));
+    setupHoldRepeat(offsetPlusBtn, (e) => (e && e.shiftKey ? 1.0 : 0.1));
+
+    // Mouse wheel on the offset label to quickly adjust by +/-0.5s or +/-1.0s (with Shift)
+    const offsetStepper = document.querySelector(".offset-stepper");
+    if (offsetStepper) {
+      offsetStepper.addEventListener("wheel", (e) => {
+        e.preventDefault();
+        const step = e.shiftKey ? 1.0 : 0.5;
+        const dir = e.deltaY < 0 ? step : -step;
+        changeOffset(dir);
+      }, { passive: false });
+    }
 
     offsetLabel.addEventListener("click", () => {
       userOffset = 0;
@@ -2056,6 +2422,7 @@ module.exports = {
   LyricsController,
   parseBusctlMetadata,
   buildPlayerState,
+  buildGenericPlayerState,
   isAdvertisement,
   isValidPlayerName,
   getWebviewContent,

@@ -105,7 +105,7 @@ async function main() {
 
   // 5. Commit and Git Tag
   console.log(`\n\x1b[34m[4/6] Committing to Git and creating Tag v${newVersion}...\x1b[0m`);
-  run(`git add package.json extension.js README.md`);
+  run(`git add -A`);
   run(`git commit -m "release: v${newVersion}"`);
   run(`git tag -a v${newVersion} -m "Release v${newVersion}"`);
   run(`git push origin main`);
