@@ -53,7 +53,7 @@ You can customize Orbit Lyrics Box via **Settings** (`Ctrl+,`):
 1. Download or package the `.vsix` file.
 2. In VS Code or Antigravity IDE, open the Extensions view (`Ctrl+Shift+X` / `Cmd+Shift+X`).
 3. Click the **`...`** (More Actions) menu at the top right of the Extensions panel.
-4. Select **Install from VSIX...** and choose `orbit-lyrics-box-1.1.1.vsix`.
+4. Select **Install from VSIX...** and choose `orbit-lyrics-box-1.1.2.vsix`.
 5. Open the **Lyrics Box** view from the Explorer sidebar or the Activity Bar icon.
 
 ---

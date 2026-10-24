@@ -14,7 +14,7 @@ if (dns.setDefaultResultOrder) {
   dns.setDefaultResultOrder("ipv4first");
 }
 
-const USER_AGENT = "OrbitLyricsBox/1.1.1";
+const USER_AGENT = "OrbitLyricsBox/1.1.2";
 // A lyrics candidate whose duration differs from the player's by more than this is a different recording.
 const DURATION_TOLERANCE_SEC = 3;
 const FETCH_TIMEOUT_MS = 8000;
@@ -848,11 +848,33 @@ async function getDarwinPlayerState(player) {
   const script = `
     tell application "${targetApp}"
       set pState to player state as string
-      set pPos to player position as integer
-      set tName to name of current track
-      set tArtist to artist of current track
-      set tAlbum to album of current track
-      set tDur to (duration of current track) / 1000
+      if pState is "stopped" then
+        return "stopped|||0|||0|||||||||"
+      end if
+      set pPos to 0
+      try
+        set pPos to (player position as real)
+      end try
+      set tName to ""
+      try
+        set tName to name of current track
+      end try
+      set tArtist to ""
+      try
+        set tArtist to artist of current track
+      end try
+      set tAlbum to ""
+      try
+        set tAlbum to album of current track
+      end try
+      set tDur to 0
+      try
+        if "${targetApp}" is "Spotify" then
+          set tDur to (duration of current track) / 1000
+        else
+          set tDur to (duration of current track) as real
+        end if
+      end try
       set artUrl to ""
       if "${targetApp}" is "Spotify" then
         try
@@ -912,128 +934,148 @@ function sendDarwinPlayerCommand(player, command, extraArgs = []) {
 // Windows PowerShell Bridge (Windows.Media.Control SMTC)
 let win32CachedState = null;
 let win32LastFetchTime = 0;
+let win32InFlightPromise = null;
 
 async function fetchWin32MediaState() {
   const now = Date.now();
-  if (win32CachedState && (now - win32LastFetchTime) < 900) {
+  if (win32CachedState && (now - win32LastFetchTime) < 350) {
     return win32CachedState;
   }
+  if (win32InFlightPromise) {
+    return win32InFlightPromise;
+  }
 
-  const psScript = `
-    Add-Type -AssemblyName System.Runtime.WindowsRuntime
-    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { 
-      $_.Name -eq 'AsTask' -and 
-      $_.GetParameters().Count -eq 1 -and 
-      $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation\`1' 
-    })[0]
+  win32LastFetchTime = now;
+  win32InFlightPromise = (async () => {
+    const psScript = `
+      Add-Type -AssemblyName System.Runtime.WindowsRuntime
+      $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { 
+        $_.Name -eq 'AsTask' -and 
+        $_.GetParameters().Count -eq 1 -and 
+        $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation\`1' 
+      })[0]
 
-    function Await($WinRtTask, $ResultType) {
-      $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
-      $netTask = $asTask.Invoke($null, @($WinRtTask))
-      $netTask.Wait(-1) | Out-Null
-      return $netTask.Result
-    }
+      function Await($WinRtTask, $ResultType) {
+        $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+        $netTask = $asTask.Invoke($null, @($WinRtTask))
+        $netTask.Wait(-1) | Out-Null
+        return $netTask.Result
+      }
 
-    $mgrType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media.Control,ContentType=WindowsRuntime]
-    $sessionManager = try { Await ($mgrType::RequestAsync()) $mgrType } catch { $null }
+      $mgrType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media.Control,ContentType=WindowsRuntime]
+      $sessionManager = try { Await ($mgrType::RequestAsync()) $mgrType } catch { $null }
 
-    if ($sessionManager) {
-      $session = $sessionManager.GetCurrentSession()
-      if (-not $session) {
-        $sessions = $sessionManager.GetSessions()
-        $session = $sessions | Where-Object { $_.GetPlaybackInfo().PlaybackStatus -eq 4 } | Select-Object -First 1
+      if ($sessionManager) {
+        $session = $sessionManager.GetCurrentSession()
         if (-not $session) {
-          $session = $sessions | Where-Object { $_.GetPlaybackInfo().PlaybackStatus -eq 5 } | Select-Object -First 1
+          $sessions = $sessionManager.GetSessions()
+          $session = $sessions | Where-Object { $_.GetPlaybackInfo().PlaybackStatus -eq 4 } | Select-Object -First 1
+          if (-not $session) {
+            $session = $sessions | Where-Object { $_.GetPlaybackInfo().PlaybackStatus -eq 5 } | Select-Object -First 1
+          }
+          if (-not $session) {
+            $session = $sessions | Select-Object -First 1
+          }
         }
-        if (-not $session) {
-          $session = $sessions | Select-Object -First 1
+
+        if ($session) {
+          $propType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties,Windows.Media.Control,ContentType=WindowsRuntime]
+          $props = try { Await ($session.TryGetMediaPropertiesAsync()) $propType } catch { $null }
+          $timeline = $session.GetTimelineProperties()
+          $playback = $session.GetPlaybackInfo()
+
+          $status = if ($playback.PlaybackStatus -eq 4) { "Playing" } elseif ($playback.PlaybackStatus -eq 5) { "Paused" } else { "Stopped" }
+          $rawPos = if ($timeline -and $timeline.Position) { $timeline.Position.TotalSeconds } else { 0 }
+          $dur = if ($timeline -and $timeline.EndTime) { [math]::Round($timeline.EndTime.TotalSeconds, 1) } else { 0 }
+          $pos = [math]::Round($rawPos, 1)
+
+          if ($status -eq "Playing" -and $timeline -and $timeline.LastUpdatedTime -and $timeline.LastUpdatedTime.Year -gt 1601) {
+            $elapsed = ([DateTimeOffset]::UtcNow - $timeline.LastUpdatedTime).TotalSeconds
+            if ($elapsed -gt 0 -and $elapsed -lt 86400) {
+              $live = $rawPos + $elapsed
+              $pos = if ($dur -gt 0) { [math]::Min($dur, [math]::Round($live, 1)) } else { [math]::Round($live, 1) }
+            }
+          }
+
+          $appId = if ($session.SourceAppUserModelId) { $session.SourceAppUserModelId } else { "win32:media" }
+          $title = if ($props -and $props.Title) { $props.Title } else { "" }
+          $artist = if ($props -and $props.Artist) { $props.Artist } else { "" }
+          $album = if ($props -and $props.AlbumTitle) { $props.AlbumTitle } else { "" }
+
+          if ($title -or $artist) {
+            Write-Output ($appId + "|||" + $status + "|||" + $pos + "|||" + $dur + "|||" + $title + "|||" + $artist + "|||" + $album)
+            exit
+          }
         }
       }
 
-      if ($session) {
-        $propType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties,Windows.Media.Control,ContentType=WindowsRuntime]
-        $props = try { Await ($session.TryGetMediaPropertiesAsync()) $propType } catch { $null }
-        $timeline = $session.GetTimelineProperties()
-        $playback = $session.GetPlaybackInfo()
-
-        $status = if ($playback.PlaybackStatus -eq 4) { "Playing" } elseif ($playback.PlaybackStatus -eq 5) { "Paused" } else { "Stopped" }
-        $pos = if ($timeline -and $timeline.Position) { [math]::Round($timeline.Position.TotalSeconds, 1) } else { 0 }
-        $dur = if ($timeline -and $timeline.EndTime) { [math]::Round($timeline.EndTime.TotalSeconds, 1) } else { 0 }
-        $appId = if ($session.SourceAppUserModelId) { $session.SourceAppUserModelId } else { "win32:media" }
-        $title = if ($props -and $props.Title) { $props.Title } else { "" }
-        $artist = if ($props -and $props.Artist) { $props.Artist } else { "" }
-        $album = if ($props -and $props.AlbumTitle) { $props.AlbumTitle } else { "" }
-
-        if ($title -or $artist) {
-          Write-Output ($appId + "|||" + $status + "|||" + $pos + "|||" + $dur + "|||" + $title + "|||" + $artist + "|||" + $album)
+      $spot = Get-Process -Name spotify -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -and $_.MainWindowTitle -ne 'Spotify' -and $_.MainWindowTitle -notlike 'Spotify *' } | Select-Object -First 1
+      if ($spot) {
+        $parts = $spot.MainWindowTitle -split ' - ', 2
+        if ($parts.Count -eq 2) {
+          Write-Output ("spotify.exe|||Playing|||0|||0|||" + $parts[1] + "|||" + $parts[0] + "|||")
           exit
         }
       }
-    }
+    `;
 
-    $spot = Get-Process -Name spotify -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -and $_.MainWindowTitle -ne 'Spotify' -and $_.MainWindowTitle -notlike 'Spotify *' } | Select-Object -First 1
-    if ($spot) {
-      $parts = $spot.MainWindowTitle -split ' - ', 2
-      if ($parts.Count -eq 2) {
-        Write-Output ("spotify.exe|||Playing|||0|||0|||" + $parts[1] + "|||" + $parts[0] + "|||")
-        exit
+    try {
+      const out = (await run("powershell", [
+        "-NoProfile",
+        "-NoLogo",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        psScript
+      ])).trim();
+
+      if (!out) {
+        win32CachedState = null;
+        return null;
       }
-    }
-  `;
 
-  try {
-    const out = (await run("powershell", [
-      "-NoProfile",
-      "-NoLogo",
-      "-NonInteractive",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-Command",
-      psScript
-    ])).trim();
+      const parts = out.split("|||");
+      if (parts.length < 5) {
+        win32CachedState = null;
+        return null;
+      }
 
-    if (!out) {
+      const rawPlayer = parts[0] || "win32:media";
+      const status = parts[1] || "Stopped";
+      const position = parseFloat(parts[2]) || 0;
+      const duration = parseFloat(parts[3]) || 0;
+      const rawTitle = parts[4] || "";
+      const rawArtist = parts[5] || "";
+      const album = parts[6] || "";
+
+      const player = rawPlayer.startsWith("win32:") ? rawPlayer : `win32:${rawPlayer}`;
+      const cleanPlayerName = player.replace(/^win32:/, "").split(/[.\\]/).pop().toLowerCase() || "media";
+
+      win32CachedState = buildGenericPlayerState({
+        player,
+        playerName: cleanPlayerName,
+        status,
+        position,
+        duration,
+        rawTitle,
+        rawArtist,
+        album,
+        artUrl: ""
+      });
+      return win32CachedState;
+    } catch (err) {
+      if (outputChannel) {
+        outputChannel.appendLine(`[LyricsBox] Windows media query error: ${err && err.message}`);
+      }
       win32CachedState = null;
       return null;
+    } finally {
+      win32InFlightPromise = null;
     }
+  })();
 
-    const parts = out.split("|||");
-    if (parts.length < 5) {
-      win32CachedState = null;
-      return null;
-    }
-
-    const rawPlayer = parts[0] || "win32:media";
-    const status = parts[1] || "Stopped";
-    const position = parseFloat(parts[2]) || 0;
-    const duration = parseFloat(parts[3]) || 0;
-    const rawTitle = parts[4] || "";
-    const rawArtist = parts[5] || "";
-    const album = parts[6] || "";
-
-    const player = rawPlayer.startsWith("win32:") ? rawPlayer : `win32:${rawPlayer}`;
-    const cleanPlayerName = player.replace(/^win32:/, "").split(/[.\\]/).pop().toLowerCase() || "media";
-
-    win32CachedState = buildGenericPlayerState({
-      player,
-      playerName: cleanPlayerName,
-      status,
-      position,
-      duration,
-      rawTitle,
-      rawArtist,
-      album,
-      artUrl: ""
-    });
-    win32LastFetchTime = Date.now();
-    return win32CachedState;
-  } catch (err) {
-    if (outputChannel) {
-      outputChannel.appendLine(`[LyricsBox] Windows media query error: ${err && err.message}`);
-    }
-    win32CachedState = null;
-    return null;
-  }
+  return win32InFlightPromise;
 }
 
 async function getWin32ActivePlayer() {
@@ -1047,13 +1089,19 @@ async function getWin32PlayerState(player) {
 }
 
 function sendWin32PlayerCommand(player, command, extraArgs = []) {
-  const methodMap = {
-    PlayPause: "TryTogglePlayPauseAsync()",
-    Next: "TrySkipNextAsync()",
-    Previous: "TrySkipPreviousAsync()"
-  };
-  const callMethod = methodMap[command];
-  if (!callMethod) return;
+  let callExpr = "";
+  if (command === "PlayPause") callExpr = "[void]$session.TryTogglePlayPauseAsync()";
+  else if (command === "Next") callExpr = "[void]$session.TrySkipNextAsync()";
+  else if (command === "Previous") callExpr = "[void]$session.TrySkipPreviousAsync()";
+  else if (command === "Seek" && extraArgs && extraArgs.length > 0) {
+    const sec = Number(extraArgs[0]);
+    if (Number.isFinite(sec)) {
+      const ticks = Math.round(sec * 10000000);
+      callExpr = `try { [void]$session.TryChangePlaybackPositionAsync([long]${ticks}) } catch { try { [void]$session.TryChangePlaybackPositionAsync([TimeSpan]::FromSeconds(${sec})) } catch {} }`;
+    }
+  }
+
+  if (!callExpr) return;
 
   const psScript = `
     Add-Type -AssemblyName System.Runtime.WindowsRuntime
@@ -1083,7 +1131,7 @@ function sendWin32PlayerCommand(player, command, extraArgs = []) {
         }
       }
       if ($session) {
-        [void]$session.${callMethod}
+        ${callExpr}
       }
     }
   `;
@@ -1233,6 +1281,8 @@ class LyricsBoxViewProvider {
         if (!Number.isFinite(targetSec)) return;
         const offsetMicro = Math.round((targetSec - (lastKnownState.position || 0)) * 1000000);
         if (process.platform === "darwin" || player.startsWith("darwin:")) {
+          sendPlayerCommand(player, "Seek", [targetSec]);
+        } else if (process.platform === "win32" || player.startsWith("win32:")) {
           sendPlayerCommand(player, "Seek", [targetSec]);
         } else {
           sendPlayerCommand(player, "Seek", ["x", String(offsetMicro)]);
@@ -2085,6 +2135,8 @@ function getWebviewContent() {
       const rect = progressTrack.getBoundingClientRect();
       const clickRatio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
       const targetSec = clickRatio * trackDuration;
+      currentPosition = targetSec;
+      updateActiveLyric(currentPosition);
       vscode.postMessage({ type: "seek", position: targetSec });
     });
 
@@ -2125,6 +2177,13 @@ function getWebviewContent() {
         lyrics = msg.lyrics || [];
         if (typeof msg.synced === "boolean") isSynced = msg.synced;
         if (msg.lyricsStatus) lyricsStatus = msg.lyricsStatus;
+        if (!trackDuration && lyrics.length) {
+          const last = lyrics[lyrics.length - 1];
+          if (last && last.time) {
+            trackDuration = last.time + 15;
+            timeTotal.innerText = formatTime(trackDuration);
+          }
+        }
         currentActiveIndex = -2;
         renderLyricsFlow();
         if (showFullLyrics) renderFullLyricsList();
@@ -2146,16 +2205,21 @@ function getWebviewContent() {
       playbackStatus = newStatus;
       trackDuration = newDuration;
 
-      // Clock Smoothing: Prevent host poll clock jitter from pulling position backwards
-      if (isTrackChange || playbackStatus !== "Playing" || Math.abs(newPos - currentPosition) > 1.8) {
-        // Hard sync on track change, seek, pause, or large delta
+      // Clock Smoothing:
+      // Hard sync on track change, when stopped/paused, or on genuine user seek
+      const drift = newPos - currentPosition;
+      const isSeek = (playbackStatus === "Playing" && (currentPosition - newPos > 2.5 || newPos - currentPosition > 2.0));
+
+      if (isTrackChange || playbackStatus !== "Playing") {
         currentPosition = newPos;
-      } else {
-        // During normal continuous playback:
-        // If host poll lags behind smooth frame clock by < 1.8s, don't snap backwards!
-        // If host poll is ahead, accept it.
-        if (newPos > currentPosition) {
-          currentPosition = newPos;
+      } else if (newPos > 0 && isSeek) {
+        // User seeked (forward or backward)
+        currentPosition = newPos;
+      } else if (newPos > 0) {
+        // Continuous playback: gently steer local 60fps clock towards platform position
+        // without any abrupt jerk or backwards snapping
+        if (Math.abs(drift) > 0.05) {
+          currentPosition += drift * 0.25;
         }
       }
       lastTickTime = performance.now();
@@ -2167,11 +2231,19 @@ function getWebviewContent() {
         if (showFullLyrics) renderFullLyricsList();
       }
 
+      if (!trackDuration && lyrics && lyrics.length) {
+        const last = lyrics[lyrics.length - 1];
+        if (last && last.time) {
+          trackDuration = last.time + 15;
+        }
+      }
+
       trackTitle.innerText = displayTitle;
       trackArtist.innerText = displayArtistText;
       let friendlyName = (state.playerName || "PLAYER").toUpperCase();
       const rawP = (state.player || "").toLowerCase();
       if (rawP.includes("spotify")) friendlyName = "SPOTIFY";
+      else if (rawP.includes("music")) friendlyName = "APPLE MUSIC";
       else if (rawP.includes("chromium")) friendlyName = "CHROMIUM";
       else if (rawP.includes("chrome")) friendlyName = "CHROME";
       else if (rawP.includes("firefox")) friendlyName = "FIREFOX";
@@ -2246,6 +2318,8 @@ function getWebviewContent() {
         div.innerText = item.text;
         div.setAttribute("data-idx", idx);
         div.addEventListener("click", () => {
+          currentPosition = item.time;
+          updateActiveLyric(currentPosition);
           vscode.postMessage({ type: "seek", position: item.time });
         });
         frag.appendChild(div);
@@ -2268,6 +2342,8 @@ function getWebviewContent() {
         div.className = "full-lyric-line" + (idx === currentActiveIndex ? " active" : "");
         div.innerText = item.text;
         div.addEventListener("click", () => {
+          currentPosition = item.time;
+          updateActiveLyric(currentPosition);
           vscode.postMessage({ type: "seek", position: item.time });
         });
         frag.appendChild(div);

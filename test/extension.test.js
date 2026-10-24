@@ -504,3 +504,48 @@ test("controller: retry delay backs off after repeated failures", async () => {
   assert.equal(c.retryAt, 1000 + 2000);
   assert.equal(attempts, 2);
 });
+
+test("buildGenericPlayerState: handles Apple Music macOS format with exact seconds duration", () => {
+  const s = buildGenericPlayerState({
+    player: "darwin:music",
+    playerName: "music",
+    status: "Playing",
+    position: 42.8,
+    duration: 215.5,
+    rawTitle: "Viva La Vida",
+    rawArtist: "Coldplay",
+    album: "Viva La Vida or Death and All His Friends",
+    artUrl: ""
+  });
+  assert.equal(s.player, "darwin:music");
+  assert.equal(s.playerName, "music");
+  assert.equal(s.title, "Viva La Vida");
+  assert.equal(s.artist, "Coldplay");
+  assert.equal(s.position, 42.8);
+  assert.equal(s.duration, 215.5);
+  assert.equal(s.lookup.duration, 215.5);
+  assert.equal(s.status, "Playing");
+});
+
+test("buildGenericPlayerState: handles Windows SMTC format with fractional live position", () => {
+  const s = buildGenericPlayerState({
+    player: "win32:Spotify.exe",
+    playerName: "spotify",
+    status: "Playing",
+    position: 88.4,
+    duration: 240.0,
+    rawTitle: "Starboy",
+    rawArtist: "The Weeknd, Daft Punk",
+    album: "Starboy",
+    artUrl: ""
+  });
+  assert.equal(s.player, "win32:Spotify.exe");
+  assert.equal(s.playerName, "spotify");
+  assert.equal(s.title, "Starboy");
+  assert.equal(s.artist, "The Weeknd, Daft Punk");
+  assert.equal(s.position, 88.4);
+  assert.equal(s.duration, 240);
+  assert.equal(s.status, "Playing");
+  assert.deepEqual(s.lookup.artists, ["The Weeknd, Daft Punk", "The Weeknd", "Daft Punk"]);
+});
+

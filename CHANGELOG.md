@@ -5,6 +5,19 @@ All notable changes to the "Orbit Lyrics Box" extension will be documented in th
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-10-24
+
+### Fixed
+- **Windows SMTC Real-Time Position Tracking**: WinRT timeline properties return static snapshots as of `LastUpdatedTime`. The extension now dynamically computes the live playback position (`Position + (UtcNow - LastUpdatedTime)`), ensuring lyrics never get stuck at 0 or snap backwards.
+- **Windows Media Seeking Support**: Implemented `TryChangePlaybackPositionAsync` for Windows SMTC so clicking on lyric lines or the progress scrubber accurately seeks the song in Spotify and Windows media players.
+- **PowerShell Query Deduplication**: Replaced overlapping tick cache with a 350ms in-flight promise to eliminate duplicate PowerShell subprocesses without stale position lags.
+- **macOS Apple Music Duration Parity**: Fixed duration unit calculation for `Music.app` (Apple Music measures track duration in seconds, whereas Spotify uses milliseconds). Apple Music lyrics now track smoothly to completion instead of freezing at 0.18s.
+- **macOS AppleScript Error Resilience**: Wrapped track metadata queries in safe AppleScript try-blocks and added explicit `stopped` state handling so empty playback queues no longer throw `-1728` execution errors.
+- **Ultra-Smooth Webview Clock Steering**: Replaced binary snapping with soft drift steering (`drift * 0.25`) to prevent micro-stutters during continuous playback while preserving instant snaps on manual seeks.
+- **Instant Optimistic Scrubbing**: Scrubbing the progress bar or clicking a lyric line now updates the UI immediately while the platform seek command completes.
+
+---
+
 ## [1.1.1] - 2026-10-24
 
 ### Fixed
