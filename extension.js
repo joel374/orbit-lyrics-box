@@ -14,7 +14,7 @@ if (dns.setDefaultResultOrder) {
   dns.setDefaultResultOrder("ipv4first");
 }
 
-const USER_AGENT = "OrbitLyricsBox/1.1.0";
+const USER_AGENT = "OrbitLyricsBox/1.1.1";
 // A lyrics candidate whose duration differs from the player's by more than this is a different recording.
 const DURATION_TOLERANCE_SEC = 3;
 const FETCH_TIMEOUT_MS = 8000;
@@ -910,69 +910,113 @@ function sendDarwinPlayerCommand(player, command, extraArgs = []) {
 }
 
 // Windows PowerShell Bridge (Windows.Media.Control SMTC)
-async function getWin32ActivePlayer() {
+let win32CachedState = null;
+let win32LastFetchTime = 0;
+
+async function fetchWin32MediaState() {
+  const now = Date.now();
+  if (win32CachedState && (now - win32LastFetchTime) < 900) {
+    return win32CachedState;
+  }
+
   const psScript = `
-    [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media,ContentType=WindowsRuntime] | Out-Null
-    $asyncOp = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()
-    $timer = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($asyncOp.Status -eq [Windows.Foundation.AsyncStatus]::Started -and $timer.ElapsedMilliseconds -lt 1500) { Start-Sleep -Milliseconds 20 }
-    $mgr = $asyncOp.GetResults()
-    $session = $mgr.GetCurrentSession()
-    if ($session) {
-      Write-Output $session.SourceAppUserModelId
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { 
+      $_.Name -eq 'AsTask' -and 
+      $_.GetParameters().Count -eq 1 -and 
+      $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation\`1' 
+    })[0]
+
+    function Await($WinRtTask, $ResultType) {
+      $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+      $netTask = $asTask.Invoke($null, @($WinRtTask))
+      $netTask.Wait(-1) | Out-Null
+      return $netTask.Result
+    }
+
+    $mgrType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media.Control,ContentType=WindowsRuntime]
+    $sessionManager = try { Await ($mgrType::RequestAsync()) $mgrType } catch { $null }
+
+    if ($sessionManager) {
+      $session = $sessionManager.GetCurrentSession()
+      if (-not $session) {
+        $sessions = $sessionManager.GetSessions()
+        $session = $sessions | Where-Object { $_.GetPlaybackInfo().PlaybackStatus -eq 4 } | Select-Object -First 1
+        if (-not $session) {
+          $session = $sessions | Where-Object { $_.GetPlaybackInfo().PlaybackStatus -eq 5 } | Select-Object -First 1
+        }
+        if (-not $session) {
+          $session = $sessions | Select-Object -First 1
+        }
+      }
+
+      if ($session) {
+        $propType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties,Windows.Media.Control,ContentType=WindowsRuntime]
+        $props = try { Await ($session.TryGetMediaPropertiesAsync()) $propType } catch { $null }
+        $timeline = $session.GetTimelineProperties()
+        $playback = $session.GetPlaybackInfo()
+
+        $status = if ($playback.PlaybackStatus -eq 4) { "Playing" } elseif ($playback.PlaybackStatus -eq 5) { "Paused" } else { "Stopped" }
+        $pos = if ($timeline -and $timeline.Position) { [math]::Round($timeline.Position.TotalSeconds, 1) } else { 0 }
+        $dur = if ($timeline -and $timeline.EndTime) { [math]::Round($timeline.EndTime.TotalSeconds, 1) } else { 0 }
+        $appId = if ($session.SourceAppUserModelId) { $session.SourceAppUserModelId } else { "win32:media" }
+        $title = if ($props -and $props.Title) { $props.Title } else { "" }
+        $artist = if ($props -and $props.Artist) { $props.Artist } else { "" }
+        $album = if ($props -and $props.AlbumTitle) { $props.AlbumTitle } else { "" }
+
+        if ($title -or $artist) {
+          Write-Output ($appId + "|||" + $status + "|||" + $pos + "|||" + $dur + "|||" + $title + "|||" + $artist + "|||" + $album)
+          exit
+        }
+      }
+    }
+
+    $spot = Get-Process -Name spotify -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -and $_.MainWindowTitle -ne 'Spotify' -and $_.MainWindowTitle -notlike 'Spotify *' } | Select-Object -First 1
+    if ($spot) {
+      $parts = $spot.MainWindowTitle -split ' - ', 2
+      if ($parts.Count -eq 2) {
+        Write-Output ("spotify.exe|||Playing|||0|||0|||" + $parts[1] + "|||" + $parts[0] + "|||")
+        exit
+      }
     }
   `;
+
   try {
-    const out = (await run("powershell", ["-NoProfile", "-NonInteractive", "-Command", psScript])).trim();
-    return out ? `win32:${out}` : null;
-  } catch (_) {
-    return null;
-  }
-}
+    const out = (await run("powershell", [
+      "-NoProfile",
+      "-NoLogo",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      psScript
+    ])).trim();
 
-async function getWin32PlayerState(player) {
-  const psScript = `
-    [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media,ContentType=WindowsRuntime] | Out-Null
-    $asyncOp = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()
-    $timer = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($asyncOp.Status -eq [Windows.Foundation.AsyncStatus]::Started -and $timer.ElapsedMilliseconds -lt 1500) { Start-Sleep -Milliseconds 20 }
-    $mgr = $asyncOp.GetResults()
-    $session = $mgr.GetCurrentSession()
-    if (-not $session) { exit }
+    if (!out) {
+      win32CachedState = null;
+      return null;
+    }
 
-    $infoAsync = $session.TryGetMediaPropertiesAsync()
-    $timer.Restart()
-    while ($infoAsync.Status -eq [Windows.Foundation.AsyncStatus]::Started -and $timer.ElapsedMilliseconds -lt 1500) { Start-Sleep -Milliseconds 20 }
-    $props = $infoAsync.GetResults()
-
-    $timeline = $session.GetTimelineProperties()
-    $playback = $session.GetPlaybackInfo()
-
-    $status = if ($playback.PlaybackStatus -eq 4) { "Playing" } elseif ($playback.PlaybackStatus -eq 5) { "Paused" } else { "Stopped" }
-    $pos = [math]::Round($timeline.Position.TotalSeconds, 1)
-    $dur = [math]::Round($timeline.EndTime.TotalSeconds, 1)
-
-    $title = if ($props.Title) { $props.Title } else { "" }
-    $artist = if ($props.Artist) { $props.Artist } else { "" }
-    $album = if ($props.AlbumTitle) { $props.AlbumTitle } else { "" }
-
-    Write-Output ($status + "|||" + $pos + "|||" + $dur + "|||" + $title + "|||" + $artist + "|||" + $album)
-  `;
-  try {
-    const out = (await run("powershell", ["-NoProfile", "-NonInteractive", "-Command", psScript])).trim();
     const parts = out.split("|||");
-    if (parts.length < 5) return null;
+    if (parts.length < 5) {
+      win32CachedState = null;
+      return null;
+    }
 
-    const status = parts[0] || "Stopped";
-    const position = parseFloat(parts[1]) || 0;
-    const duration = parseFloat(parts[2]) || 0;
-    const rawTitle = parts[3] || "";
-    const rawArtist = parts[4] || "";
-    const album = parts[5] || "";
+    const rawPlayer = parts[0] || "win32:media";
+    const status = parts[1] || "Stopped";
+    const position = parseFloat(parts[2]) || 0;
+    const duration = parseFloat(parts[3]) || 0;
+    const rawTitle = parts[4] || "";
+    const rawArtist = parts[5] || "";
+    const album = parts[6] || "";
 
-    return buildGenericPlayerState({
+    const player = rawPlayer.startsWith("win32:") ? rawPlayer : `win32:${rawPlayer}`;
+    const cleanPlayerName = player.replace(/^win32:/, "").split(/[.\\]/).pop().toLowerCase() || "media";
+
+    win32CachedState = buildGenericPlayerState({
       player,
-      playerName: player.replace("win32:", "").split(".")[0] || "player",
+      playerName: cleanPlayerName,
       status,
       position,
       duration,
@@ -981,9 +1025,25 @@ async function getWin32PlayerState(player) {
       album,
       artUrl: ""
     });
-  } catch (_) {
+    win32LastFetchTime = Date.now();
+    return win32CachedState;
+  } catch (err) {
+    if (outputChannel) {
+      outputChannel.appendLine(`[LyricsBox] Windows media query error: ${err && err.message}`);
+    }
+    win32CachedState = null;
     return null;
   }
+}
+
+async function getWin32ActivePlayer() {
+  const state = await fetchWin32MediaState();
+  return state ? state.player : null;
+}
+
+async function getWin32PlayerState(player) {
+  const state = await fetchWin32MediaState();
+  return state;
 }
 
 function sendWin32PlayerCommand(player, command, extraArgs = []) {
@@ -994,17 +1054,49 @@ function sendWin32PlayerCommand(player, command, extraArgs = []) {
   };
   const callMethod = methodMap[command];
   if (!callMethod) return;
+
   const psScript = `
-    [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media,ContentType=WindowsRuntime] | Out-Null
-    $asyncOp = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()
-    $timer = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($asyncOp.Status -eq [Windows.Foundation.AsyncStatus]::Started -and $timer.ElapsedMilliseconds -lt 1500) { Start-Sleep -Milliseconds 20 }
-    $mgr = $asyncOp.GetResults()
-    $session = $mgr.GetCurrentSession()
-    if ($session) { [void]$session.${callMethod} }
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { 
+      $_.Name -eq 'AsTask' -and 
+      $_.GetParameters().Count -eq 1 -and 
+      $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation\`1' 
+    })[0]
+
+    function Await($WinRtTask, $ResultType) {
+      $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+      $netTask = $asTask.Invoke($null, @($WinRtTask))
+      $netTask.Wait(-1) | Out-Null
+      return $netTask.Result
+    }
+
+    $mgrType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media.Control,ContentType=WindowsRuntime]
+    $sessionManager = try { Await ($mgrType::RequestAsync()) $mgrType } catch { $null }
+
+    if ($sessionManager) {
+      $session = $sessionManager.GetCurrentSession()
+      if (-not $session) {
+        $sessions = $sessionManager.GetSessions()
+        $session = $sessions | Where-Object { $_.GetPlaybackInfo().PlaybackStatus -eq 4 } | Select-Object -First 1
+        if (-not $session) {
+          $session = $sessions | Select-Object -First 1
+        }
+      }
+      if ($session) {
+        [void]$session.${callMethod}
+      }
+    }
   `;
-  run("powershell", ["-NoProfile", "-NonInteractive", "-Command", psScript])
-    .catch(err => console.error("[LyricsBox] Windows Command error:", command, err));
+
+  run("powershell", [
+    "-NoProfile",
+    "-NoLogo",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    psScript
+  ]).catch(err => console.error("[LyricsBox] Windows Command error:", command, err));
 }
 
 // ------------------------------------------------------------------
