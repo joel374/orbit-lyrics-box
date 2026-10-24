@@ -5,6 +5,14 @@ All notable changes to the "Orbit Lyrics Box" extension will be documented in th
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3] - 2026-10-24
+
+### Fixed
+- **Marketplace Logo Display**: Switched README header logo to use persistent Open-VSX CDN URL, preventing broken image rendering inside extension details.
+- **Marketplace Badges**: Replaced deprecated/retired shields.io badges with live Open-VSX metrics (Version, Downloads counter, Rating, and Platform support).
+
+---
+
 ## [1.1.2] - 2026-10-24
 
 ### Fixed

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="media/icon.png" width="128" height="128" alt="Orbit Lyrics Box Logo" />
+  <img src="https://open-vsx.org/api/JoelManisali/orbit-lyrics-box/latest/file/icon.png" width="128" height="128" alt="Orbit Lyrics Box Logo" />
 </p>
 
 # Lyrics Box 🎵 (Live Karaoke Subtitle)
@@ -7,13 +7,12 @@
 > Real-time synced lyrics & subtitle player widget for VS Code and Antigravity IDE. Automatically detects your active media playback (Chromium, Spotify, YouTube, etc.) and synchronizes karaoke lyrics directly inside your editor.
 
 <p align="center">
-  <a href="https://marketplace.visualstudio.com/items?itemName=JoelManisali.orbit-lyrics-box"><img src="https://img.shields.io/visual-studio-marketplace/v/JoelManisali.orbit-lyrics-box?style=flat-square&color=blue&label=VS%20Code%20Marketplace" alt="Marketplace Version" /></a>
-  <a href="https://marketplace.visualstudio.com/items?itemName=JoelManisali.orbit-lyrics-box"><img src="https://img.shields.io/visual-studio-marketplace/i/JoelManisali.orbit-lyrics-box?style=flat-square&color=success&logo=visual-studio-code" alt="Marketplace Installs" /></a>
   <a href="https://open-vsx.org/extension/JoelManisali/orbit-lyrics-box"><img src="https://img.shields.io/open-vsx/v/JoelManisali/orbit-lyrics-box?style=flat-square&color=purple&label=Open%20VSX" alt="Open VSX Version" /></a>
-  <a href="https://marketplace.visualstudio.com/items?itemName=JoelManisali.orbit-lyrics-box"><img src="https://img.shields.io/visual-studio-marketplace/r/JoelManisali.orbit-lyrics-box?style=flat-square&color=orange" alt="Marketplace Rating" /></a>
-  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg?style=flat-square" alt="Platform Linux | macOS | Windows" />
+  <a href="https://open-vsx.org/extension/JoelManisali/orbit-lyrics-box"><img src="https://img.shields.io/open-vsx/dt/JoelManisali/orbit-lyrics-box?style=flat-square&color=blue&label=Downloads" alt="Open VSX Downloads" /></a>
+  <a href="https://open-vsx.org/extension/JoelManisali/orbit-lyrics-box"><img src="https://img.shields.io/open-vsx/rating/JoelManisali/orbit-lyrics-box?style=flat-square&color=orange&label=Rating" alt="Open VSX Rating" /></a>
+  <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg?style=flat-square" alt="Platform Linux | macOS | Windows" />
   <a href="https://ko-fi.com/joelmanisali"><img src="https://img.shields.io/badge/Ko--fi-Support%20Me-ff5e5b?style=flat-square&logo=ko-fi&logoColor=white" alt="Support on Ko-fi" /></a>
-  <img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License MIT" />
+  <img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat-square" alt="License MIT" />
 </p>
 
 ---
@@ -53,7 +52,7 @@ You can customize Orbit Lyrics Box via **Settings** (`Ctrl+,`):
 1. Download or package the `.vsix` file.
 2. In VS Code or Antigravity IDE, open the Extensions view (`Ctrl+Shift+X` / `Cmd+Shift+X`).
 3. Click the **`...`** (More Actions) menu at the top right of the Extensions panel.
-4. Select **Install from VSIX...** and choose `orbit-lyrics-box-1.1.2.vsix`.
+4. Select **Install from VSIX...** and choose `orbit-lyrics-box-1.1.3.vsix`.
 5. Open the **Lyrics Box** view from the Explorer sidebar or the Activity Bar icon.
 
 ---
