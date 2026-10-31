@@ -14,7 +14,7 @@ if (dns.setDefaultResultOrder) {
   dns.setDefaultResultOrder("ipv4first");
 }
 
-const USER_AGENT = "OrbitLyricsBox/1.1.3";
+const USER_AGENT = "OrbitLyricsBox/1.1.4";
 // A lyrics candidate whose duration differs from the player's by more than this is a different recording.
 const DURATION_TOLERANCE_SEC = 3;
 const FETCH_TIMEOUT_MS = 8000;
@@ -36,17 +36,18 @@ let outputChannel = null;
 const DASH_SPLIT = /\s+[-–—]\s+/;
 
 // Always removed: pure noise that never appears in a lyrics database entry.
-const NOISE_BRACKET = /\s*[\(\[](?:official(?:\s*(?:music\s*)?video|\s*audio|\s*lyric\s*(?:video)?|\s*visuali[sz]er|\s*clip)?|(?:lyrics?|audio|lyric)(?:\s*video)?|visuali[sz]er|visualiser|hd|4k|mv|hq|clip\s*officiel|video\s*oficial|vorsicht|(?:sub|subtitle|lirik|terjemahan|indo|eng|thai|viet|kor|esp|fr)(?:\s*(?:sub|indo|eng|thai|viet|kor|esp|fr|lyrics?|terjemahan))?)[^\)\]]*[\)\]]/gi;
-const COVER_BRACKET = /\s*[\(\[][^\)\]]*cover[^\)\]]*[\)\]]/gi;
+const NOISE_BRACKET = /\s*[\(\[【〔［（](?:official(?:\s*(?:music\s*)?video|\s*audio|\s*lyric\s*(?:video)?|\s*visuali[sz]er|\s*clip)?|(?:lyrics?|audio|lyric)(?:\s*video)?|visuali[sz]er|visualiser|hd|4k|mv|hq|clip\s*officiel|video\s*oficial|vorsicht|(?:sub|subtitle|lirik|terjemahan|indo|eng|thai|viet|kor|esp|fr)(?:\s*(?:sub|indo|eng|thai|viet|kor|esp|fr|lyrics?|terjemahan))?)[^\)\]】〕］）]*[\)\]】〕］）]/gi;
+const COVER_BRACKET = /\s*[\(\[【〔［（][^\)\]】〕］）]*cover[^\)\]】〕］）]*[\)\]】〕］）]/gi;
 // Remaster info never changes the lyrics or the timing, so it is always removed.
-const REMASTER_BRACKET = /\s*[\(\[][^\)\]]*(?<![\p{L}\p{N}])re-?master(?:ed)?(?![\p{L}\p{N}])[^\)\]]*[\)\]]/giu;
+const REMASTER_BRACKET = /\s*[\(\[【〔［（][^\)\]】〕］）]*(?<![\p{L}\p{N}])re-?master(?:ed)?(?![\p{L}\p{N}])[^\)\]】〕］）]*[\)\]】〕］）]/giu;
 // Version tags (remix, live, ...). Kept for the first lookup, removed for the fallback lookup.
-const VERSION_BRACKET = /\s*[\(\[][^\)\]]*(?<![\p{L}\p{N}])(?:feat\.?|ft\.?|featuring|with|live|acoustic|version|mono|stereo|edit|remix|rmx|mix|dj|instrumental|extended|bootleg|mashup|sped\s*up|slowed|reverb|demo|session|unreleased|bonus|deluxe|radio|single|ost|soundtrack)(?![\p{L}\p{N}])[^\)\]]*[\)\]]/giu;
+const VERSION_BRACKET = /\s*[\(\[【〔［（][^\)\]】〕］）]*(?<![\p{L}\p{N}])(?:feat\.?|ft\.?|featuring|with|live|acoustic|version|mono|stereo|edit|remix|rmx|mix|dj|instrumental|extended|bootleg|mashup|sped\s*up|slowed|reverb|demo|session|unreleased|bonus|deluxe|radio|single|ost|soundtrack)(?![\p{L}\p{N}])[^\)\]】〕］）]*[\)\]】〕］）]/giu;
 const TRAILING_FEAT = /\s*[-–]?\s*\b(?:feat\.?|ft\.?|featuring)\b.*$/i;
 // "Title - Remastered 2009", "Title - Official Video": suffixes that carry no useful information.
 const DROPPABLE_SUFFIX = /re-?master|^(?:official|lyrics?|audio|video|visuali[sz]er|hd|4k|mv)\b/i;
 // Decides whether the text after " - " is a version tag (suffix) rather than the real title.
-const TAG_LIKE_SUFFIX = /(?<![\p{L}\p{N}])(?:re-?master(?:ed)?|live|acoustic|edit|remix|rmx|mix|version|mono|stereo|demo|session|instrumental|extended|bootleg|mashup|radio|single|deluxe|bonus|official|lyrics?|audio|video|visuali[sz]er|feat\.?|ft\.?)(?![\p{L}\p{N}])/iu;
+const TAG_LIKE_SUFFIX = /^\s*(?:(?:\d{4}\s+)?re-?master(?:ed)?|(?:\d{4}\s+)?remaster|live\b|acoustic\b|radio\s+edit|club\s+mix|instrumental\b|bonus\b|extended\b|remix\b|rmx\b|deluxe\b|session\b|demo\b|mono\b|stereo\b)/iu;
+const QUOTE_WRAP = /^[\s"“'‘«‹「『]+|[\s"”'’»›」』]+$/gu;
 
 function collapseSpaces(str) {
   return str.replace(/\s{2,}/g, " ").trim();
@@ -58,6 +59,8 @@ function cleanArtistName(artist) {
     .replace(/\\"/g, '"')
     .replace(/\s*VEVO$/i, "")
     .replace(/\s*-\s*Topic$/i, "")
+    .replace(/\s+Official(?:\s+(?:YouTube\s+)?Channel)?$/i, "")
+    .replace(QUOTE_WRAP, "")
     .trim();
 }
 
@@ -106,6 +109,21 @@ function cleanTrackInfo(rawTitle, rawArtist) {
   let artistFromTitle = false;
   let dashSuffix = "";
 
+  // Strip pipe / double-slash noise trailers commonly found in YouTube titles:
+  // e.g. "Dewa - Pangeran Cinta | Official 4K Remastered Video" -> "Dewa - Pangeran Cinta"
+  // e.g. "Artist - Title | Official Music Video" -> "Artist - Title"
+  // e.g. "Artist - Title | Aquarius Musikindo" -> "Artist - Title"
+  const pipeMatch = title.match(/^(.*?)\s*(?:\||\/\/|•)\s*(.*)$/);
+  if (pipeMatch) {
+    const beforePipe = pipeMatch[1].trim();
+    const afterPipe = pipeMatch[2].trim();
+    if (DASH_SPLIT.test(beforePipe)) {
+      title = beforePipe;
+    } else if (/(?:official|video|audio|lyric|visuali[sz]er|mv|4k|hd|remaster|lirik|clip)/i.test(afterPipe) || (artist && artistMatches(afterPipe, [artist]))) {
+      title = beforePipe;
+    }
+  }
+
   // Strip noise brackets like [Official Video], [Sub Thai], (Lyric Video) before splitting on dash
   const preCleaned = collapseSpaces(title.replace(NOISE_BRACKET, "").replace(COVER_BRACKET, "").replace(REMASTER_BRACKET, "")) || title;
   const parts = preCleaned.split(DASH_SPLIT);
@@ -138,12 +156,13 @@ function cleanTrackInfo(rawTitle, rawArtist) {
   }
 
   let core = title.replace(NOISE_BRACKET, "").replace(COVER_BRACKET, "").replace(REMASTER_BRACKET, "");
-  core = collapseSpaces(core);
-  if (!core) core = collapseSpaces(originalTitle);
+  core = collapseSpaces(core).replace(QUOTE_WRAP, "");
+  if (!core) core = collapseSpaces(originalTitle).replace(QUOTE_WRAP, "");
 
   const keepSuffix = dashSuffix && !DROPPABLE_SUFFIX.test(dashSuffix);
-  const withTags = keepSuffix ? `${core} - ${dashSuffix}` : core;
-  const bare = collapseSpaces(core.replace(VERSION_BRACKET, "").replace(TRAILING_FEAT, "")) || core;
+  const cleanDashSuffix = dashSuffix.replace(QUOTE_WRAP, "");
+  const withTags = keepSuffix ? `${core} - ${cleanDashSuffix}` : core;
+  const bare = collapseSpaces(core.replace(VERSION_BRACKET, "").replace(TRAILING_FEAT, "")).replace(QUOTE_WRAP, "") || core;
 
   const titleVariants = [];
   for (const v of [withTags, bare]) {
@@ -156,8 +175,8 @@ function cleanTrackInfo(rawTitle, rawArtist) {
     artist,
     artistFromTitle,
     alternative: alternative ? {
-      title: alternative.title,
-      artist: alternative.artist
+      title: alternative.title.replace(QUOTE_WRAP, ""),
+      artist: alternative.artist.replace(QUOTE_WRAP, "")
     } : null
   };
 }
@@ -1127,6 +1146,9 @@ function sendWin32PlayerCommand(player, command, extraArgs = []) {
         $sessions = $sessionManager.GetSessions()
         $session = $sessions | Where-Object { $_.GetPlaybackInfo().PlaybackStatus -eq 4 } | Select-Object -First 1
         if (-not $session) {
+          $session = $sessions | Where-Object { $_.GetPlaybackInfo().PlaybackStatus -eq 5 } | Select-Object -First 1
+        }
+        if (-not $session) {
           $session = $sessions | Select-Object -First 1
         }
       }
@@ -1280,6 +1302,7 @@ class LyricsBoxViewProvider {
         const targetSec = Number(msg.position);
         if (!Number.isFinite(targetSec)) return;
         const offsetMicro = Math.round((targetSec - (lastKnownState.position || 0)) * 1000000);
+        lastKnownState.position = targetSec;
         if (process.platform === "darwin" || player.startsWith("darwin:")) {
           sendPlayerCommand(player, "Seek", [targetSec]);
         } else if (process.platform === "win32" || player.startsWith("win32:")) {
@@ -2206,20 +2229,16 @@ function getWebviewContent() {
       trackDuration = newDuration;
 
       // Clock Smoothing:
-      // Hard sync on track change, when stopped/paused, or on genuine user seek
+      // Hard sync on track change, when stopped/paused, or on genuine seek / noticeable drift
       const drift = newPos - currentPosition;
-      const isSeek = (playbackStatus === "Playing" && (currentPosition - newPos > 2.5 || newPos - currentPosition > 2.0));
+      const isSeek = (playbackStatus === "Playing" && Math.abs(drift) > 0.45);
 
-      if (isTrackChange || playbackStatus !== "Playing") {
-        currentPosition = newPos;
-      } else if (newPos > 0 && isSeek) {
-        // User seeked (forward or backward)
+      if (isTrackChange || playbackStatus !== "Playing" || isSeek) {
         currentPosition = newPos;
       } else if (newPos > 0) {
         // Continuous playback: gently steer local 60fps clock towards platform position
-        // without any abrupt jerk or backwards snapping
-        if (Math.abs(drift) > 0.05) {
-          currentPosition += drift * 0.25;
+        if (Math.abs(drift) > 0.04) {
+          currentPosition += drift * 0.4;
         }
       }
       lastTickTime = performance.now();
@@ -2352,7 +2371,7 @@ function getWebviewContent() {
       fullLyricsContainer.appendChild(frag);
     }
 
-    const BASE_ADVANCE_OFFSET = 0.35;
+    const BASE_ADVANCE_OFFSET = 0.0;
 
     // Binary search O(log N) for ultra-fast active lyric lookup at 60-120fps
     function findActiveLyricIndex(time) {
@@ -2410,8 +2429,10 @@ function getWebviewContent() {
 
     // Smooth Clock & Scrubber Loop
     function frameLoop(now) {
-      const delta = (now - lastTickTime) / 1000;
+      let delta = (now - lastTickTime) / 1000;
       lastTickTime = now;
+      if (delta > 0.5) delta = 0.5;
+      if (delta < 0) delta = 0;
 
       if (playbackStatus === "Playing") {
         currentPosition += delta;

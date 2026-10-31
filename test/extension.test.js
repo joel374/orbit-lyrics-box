@@ -549,3 +549,46 @@ test("buildGenericPlayerState: handles Windows SMTC format with fractional live 
   assert.deepEqual(s.lookup.artists, ["The Weeknd, Daft Punk", "The Weeknd", "Daft Punk"]);
 });
 
+test("cleanTrackInfo: handles YouTube title with pipe trailer and record label channel", () => {
+  const r = cleanTrackInfo("Dewa - Pangeran Cinta | Official 4K Remastered Video", "Aquarius Musikindo");
+  assert.equal(r.title, "Pangeran Cinta");
+  assert.equal(r.artist, "Dewa");
+  assert.equal(r.artistFromTitle, true);
+});
+
+test("cleanTrackInfo: handles YouTube title with pipe channel trailer", () => {
+  const r = cleanTrackInfo("Dewa 19 - Kangen | Aquarius Musikindo", "Aquarius Musikindo");
+  assert.equal(r.title, "Kangen");
+  assert.equal(r.artist, "Dewa 19");
+  assert.equal(r.artistFromTitle, true);
+});
+
+test("cleanTrackInfo: preserves live suffix in title instead of collapsing to artist", () => {
+  const r = cleanTrackInfo("Coldplay - Yellow (Live)", "Some Channel");
+  assert.equal(r.title, "Yellow (Live)");
+  assert.equal(r.artist, "Coldplay");
+  assert.equal(r.artistFromTitle, true);
+});
+
+test("cleanTrackInfo: strips Japanese corner brackets from track title", () => {
+  const r = cleanTrackInfo("米津玄師 - 「Lemon」", "Some Channel");
+  assert.equal(r.title, "Lemon");
+  assert.equal(r.artist, "米津玄師");
+  assert.equal(r.artistFromTitle, true);
+});
+
+test("cleanTrackInfo: strips Asian full-width noise brackets", () => {
+  const r = cleanTrackInfo("YOASOBI - 夜に駆ける 【Official Music Video】", "");
+  assert.equal(r.title, "夜に駆ける");
+  assert.equal(r.artist, "YOASOBI");
+  assert.equal(r.artistFromTitle, true);
+});
+
+test("cleanTrackInfo: strips surrounding quotes from title", () => {
+  const r = cleanTrackInfo('Queen - "Bohemian Rhapsody"', "Queen Official");
+  assert.equal(r.title, "Bohemian Rhapsody");
+  assert.equal(r.artist, "Queen");
+});
+
+
+

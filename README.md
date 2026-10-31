@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://open-vsx.org/api/JoelManisali/orbit-lyrics-box/latest/file/icon.png" width="128" height="128" alt="Orbit Lyrics Box Logo" />
+  <img src="https://raw.githubusercontent.com/joel374/orbit-lyrics-box/main/media/icon.png" width="128" height="128" alt="Orbit Lyrics Box Logo" />
 </p>
 
 # Lyrics Box 🎵 (Live Karaoke Subtitle)
@@ -52,7 +52,7 @@ You can customize Orbit Lyrics Box via **Settings** (`Ctrl+,`):
 1. Download or package the `.vsix` file.
 2. In VS Code or Antigravity IDE, open the Extensions view (`Ctrl+Shift+X` / `Cmd+Shift+X`).
 3. Click the **`...`** (More Actions) menu at the top right of the Extensions panel.
-4. Select **Install from VSIX...** and choose `orbit-lyrics-box-1.1.3.vsix`.
+4. Select **Install from VSIX...** and choose `orbit-lyrics-box-1.1.4.vsix`.
 5. Open the **Lyrics Box** view from the Explorer sidebar or the Activity Bar icon.
 
 ---

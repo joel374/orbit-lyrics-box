@@ -5,6 +5,19 @@ All notable changes to the "Orbit Lyrics Box" extension will be documented in th
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.4] - 2026-10-31
+
+### Fixed
+- **Precision Karaoke Real-Time Sync**: Eliminated hardcoded +350ms premature advance offset (`BASE_ADVANCE_OFFSET = 0.0`) and tightened clock drift threshold, ensuring karaoke lines highlight at the exact moment the vocals are sung across all platforms without running ahead.
+- **YouTube Metadata & Pipe Trailer Stripping**: Corrected title/artist parsing for YouTube titles with pipe separators (e.g. `Artist - Title | Official 4K Remastered Video`) and anchored tag-like suffix matching so songs from record label channels (e.g. Dewa 19 on Aquarius Musikindo) correctly fetch lyrics instead of showing "No lyrics found".
+- **Quotes and CJK Bracket Sanitization**: Automatically strip surrounding quotation marks (`"`, `'`, `“`, `”`) and Japanese corner brackets (`「`, `」`, `『`, `』`) from track titles and artist names (e.g. 米津玄師 - 「Lemon」).
+- **Full-Width Bracket Support**: Expanded noise and version tag patterns to support full-width Asian brackets (`【...】`, `〔...〕`, `［...］`, `（...）`).
+- **Windows SMTC Paused Session Resume**: Added Status 5 (Paused) session fallback in Windows player command dispatch, ensuring Play/Pause commands reliably resume paused playback on Windows 10/11.
+- **Consecutive Seek Precision**: Optimistically updated `lastKnownState.position` during seek dispatch to prevent relative seek drift during rapid scrubs on Linux MPRIS.
+- **Extension Marketplace Logo Rendering**: Switched README header logo to direct raw GitHub CDN to resolve blocked `application/octet-stream` rendering on Open-VSX in IDE extension details.
+
+---
+
 ## [1.1.3] - 2026-10-24
 
 ### Fixed
