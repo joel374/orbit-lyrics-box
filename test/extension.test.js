@@ -6,7 +6,8 @@ const ext = require("../extension.js");
 const {
   cleanTrackInfo, normalizeForMatch, artistMatches, rankCandidates, pickBestCandidate,
   parseLrc, lookupLyrics, fetchLyricsFromLRCLIB, LyricsController, parseBusctlMetadata,
-  buildPlayerState, buildGenericPlayerState, isValidPlayerName, getWebviewContent
+  buildPlayerState, buildGenericPlayerState, fileUrlToLocalPath, isAdvertisement,
+  isValidPlayerName, getWebviewContent
 } = ext;
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -22,6 +23,34 @@ test("parseLrc: parses timestamps, skips empty lines, sorts by time", () => {
   ]);
   assert.deepEqual(parseLrc(""), []);
   assert.deepEqual(parseLrc(null), []);
+});
+
+test("parseLrc: one line with multiple timestamps expands into multiple lines", () => {
+  const lines = parseLrc("[00:10.00][01:02.50] chorus\n[00:05.00] verse");
+  assert.deepEqual(lines, [
+    { time: 5, text: "verse" },
+    { time: 10, text: "chorus" },
+    { time: 62.5, text: "chorus" }
+  ]);
+});
+
+test("parseLrc: handles CRLF line endings", () => {
+  assert.deepEqual(parseLrc("[00:01.00] a\r\n[00:02.00] b"), [
+    { time: 1, text: "a" },
+    { time: 2, text: "b" }
+  ]);
+});
+
+test("fileUrlToLocalPath: resolves Windows, POSIX and UNC file URLs", () => {
+  // Windows: the leading slash before the drive letter must be dropped, otherwise
+  // fs.statSync('/C:/Users/...') fails and the album art never loads.
+  assert.equal(fileUrlToLocalPath("file:///C:/Users/joel/art%20work.jpg"), "C:/Users/joel/art work.jpg");
+  assert.equal(fileUrlToLocalPath("file:///c:/Music/a.jpg"), "c:/Music/a.jpg");
+  // POSIX: the leading slash is part of the path and must be preserved.
+  assert.equal(fileUrlToLocalPath("file:///home/joel/art%20work.jpg"), "/home/joel/art work.jpg");
+  assert.equal(fileUrlToLocalPath("file://localhost/home/joel/a.jpg"), "/home/joel/a.jpg");
+  // UNC share.
+  assert.equal(fileUrlToLocalPath("file://NAS/Music/a.jpg"), "//NAS/Music/a.jpg");
 });
 
 test("normalizeForMatch: Latin text", () => {
@@ -382,6 +411,14 @@ test("controller: a track without a title yields 'none' and no fetch", () => {
   assert.equal(fetches, 0);
 });
 
+test("isAdvertisement: flags real ads but not songs that merely contain ad-like words", () => {
+  assert.equal(isAdvertisement("Advertisement", "", ""), true);
+  assert.equal(isAdvertisement("Advertisement", "Spotify"), true);
+  assert.equal(isAdvertisement("Song", "Spotify", "spotify:ad:123"), true);
+  assert.equal(isAdvertisement("Commercial", "Some Artist"), false);
+  assert.equal(isAdvertisement("Promoted", "Some Artist"), false);
+});
+
 /* ---------- Task 5: MPRIS parsing ---------- */
 
 const META = 'a{sv} 7 "mpris:trackid" o "/org/mpris/MediaPlayer2/Track/1" "mpris:length" x 225000000 "mpris:artUrl" s "https://i.scdn.co/image/abc" "xesam:album" s "Some Album" "xesam:artist" as 2 "Artist One" "Artist Two" "xesam:title" s "Song" "xesam:url" s "https://open.spotify.com/track/1"';
@@ -449,6 +486,12 @@ test("buildPlayerState: no metadata falls back to display placeholders", () => {
   assert.equal(s.title, "Unknown Track");
   assert.equal(s.artist, "Unknown Artist");
   assert.equal(s.status, "Stopped");
+});
+
+test("buildPlayerState: a player without Position yields null so the local clock is kept", () => {
+  const meta = 'a{sv} 1 "xesam:title" s "Song"';
+  const s = buildPlayerState("org.mpris.MediaPlayer2.browser", 's "Playing"', "", meta);
+  assert.equal(s.position, null);
 });
 
 test("buildGenericPlayerState: handles comma-separated artists and formats lookup", () => {

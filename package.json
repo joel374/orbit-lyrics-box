@@ -2,7 +2,7 @@
   "name": "orbit-lyrics-box",
   "displayName": "Lyrics Box (Live Karaoke Subtitle)",
   "description": "Realtime Synced Lyrics & Subtitle Box widget for your music player (Chrome, Spotify, etc.) directly in Antigravity IDE",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "publisher": "JoelManisali",
   "author": {
     "name": "Joel Legifani Manisali",
@@ -33,7 +33,7 @@
   ],
   "main": "./extension.js",
   "scripts": {
-    "test": "node --test test/*.test.js",
+    "test": "node --test",
     "package": "vsce package",
     "release": "node scripts/release.js"
   },

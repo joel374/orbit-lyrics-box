@@ -5,9 +5,29 @@ All notable changes to the "Orbit Lyrics Box" extension will be documented in th
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.5] - 2026-11-06
+
+### Added
+
+- **Node 16 / VS Code 1.75 Compatibility**: Added built-in HTTPS fallback shim for runtimes where global `fetch` is not available, ensuring backward compatibility with older VS Code releases.
+
+### Fixed
+
+- **Multi-Timestamp LRC Parsing**: Improved LRC parser to support lines with multiple timestamp tags (e.g., `[00:10.00][01:02.50] repeated chorus`) and normalized CRLF line endings.
+- **Advertisement Detection Guard**: Refined advertisement heuristics to prevent false-positive ad flags on legitimate track titles like "Commercial" or artist names like "Promoted".
+- **Local Clock Stability**: Maintained smooth local clock progression when media player status does not report a track position property instead of dropping to zero.
+- **Release Script Token Masking**: Masked publisher tokens (`VSCE_PAT`, `OVSX_PAT`) in release logs for enhanced security.
+- **Windows Album Art Paths**: `file:///C:/...` artwork URLs are now converted to valid Windows paths (drive letters and UNC shares), so local album art loads on Windows as well as macOS/Linux.
+- **Windows PowerShell Encoding**: The Windows media session query now forces UTF-8 console output, preventing mojibake in non-ASCII (e.g. Japanese/Korean) track titles.
+- **Windows Release Script**: npm/npx are invoked through their JS entrypoint (with a `.cmd` fallback) so `npm run release` no longer fails with `EINVAL` on modern Node versions on Windows.
+- **Cross-Platform Test Command**: `npm test` now uses Node's built-in test file discovery instead of a shell-expanded glob, which does not work in Windows `cmd.exe`.
+
+---
+
 ## [1.1.4] - 2026-10-31
 
 ### Fixed
+
 - **Precision Karaoke Real-Time Sync**: Eliminated hardcoded +350ms premature advance offset (`BASE_ADVANCE_OFFSET = 0.0`) and tightened clock drift threshold, ensuring karaoke lines highlight at the exact moment the vocals are sung across all platforms without running ahead.
 - **YouTube Metadata & Pipe Trailer Stripping**: Corrected title/artist parsing for YouTube titles with pipe separators (e.g. `Artist - Title | Official 4K Remastered Video`) and anchored tag-like suffix matching so songs from record label channels (e.g. Dewa 19 on Aquarius Musikindo) correctly fetch lyrics instead of showing "No lyrics found".
 - **Quotes and CJK Bracket Sanitization**: Automatically strip surrounding quotation marks (`"`, `'`, `“`, `”`) and Japanese corner brackets (`「`, `」`, `『`, `』`) from track titles and artist names (e.g. 米津玄師 - 「Lemon」).
@@ -21,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.1.3] - 2026-10-24
 
 ### Fixed
+
 - **Marketplace Logo Display**: Switched README header logo to use persistent Open-VSX CDN URL, preventing broken image rendering inside extension details.
 - **Marketplace Badges**: Replaced deprecated/retired shields.io badges with live Open-VSX metrics (Version, Downloads counter, Rating, and Platform support).
 
@@ -29,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.1.2] - 2026-10-24
 
 ### Fixed
+
 - **Windows SMTC Real-Time Position Tracking**: WinRT timeline properties return static snapshots as of `LastUpdatedTime`. The extension now dynamically computes the live playback position (`Position + (UtcNow - LastUpdatedTime)`), ensuring lyrics never get stuck at 0 or snap backwards.
 - **Windows Media Seeking Support**: Implemented `TryChangePlaybackPositionAsync` for Windows SMTC so clicking on lyric lines or the progress scrubber accurately seeks the song in Spotify and Windows media players.
 - **PowerShell Query Deduplication**: Replaced overlapping tick cache with a 350ms in-flight promise to eliminate duplicate PowerShell subprocesses without stale position lags.
@@ -42,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.1.1] - 2026-10-24
 
 ### Fixed
+
 - **Windows Media Detection**: Resolved an issue where Windows 10/11 media players (Spotify, Chrome, Edge) were stuck in a loading state due to WinRT async resolution.
 - **Multi-Session Active Fallback**: When VS Code is focused, the Windows session manager now automatically inspects all active media sessions (`GetSessions`) to track playing music seamlessly.
 - **Spotify Desktop Window Fallback**: Added a process-level window title fallback for Spotify Desktop on Windows when SMTC metadata is delayed.
@@ -52,6 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.1.0] - 2026-10-23
 
 ### Added
+
 - **Cross-Platform Support**:
   - **macOS**: Native AppleScript integration for Spotify and Apple Music (`Music.app`) with seeking support.
   - **Windows**: Windows Media Transport Controls (SMTC) integration for Chrome, Spotify, Edge, and media players.
@@ -63,6 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Support & Funding**: Added official Ko-fi badge and metadata.
 
 ### Fixed
+
 - **Synced Lyrics Priority**: Fixed an issue where plain text lyrics were chosen over available synced lyrics when tags were inverted.
 - **Artist Name Variance**: Enhanced candidate matching for full artist names (e.g. "Adele Adkins" vs "Adele").
 - **Version Bracket Discrepancy**: Allowed matching for candidate tracks with version tags like `(Unreleased)` when audio duration matches.
@@ -72,6 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.0.4] - 2026-10-15
 
 ### Added
+
 - Real-time synced lyrics & subtitle player widget for VS Code and Antigravity IDE.
 - Zero-config media playback detection via Linux MPRIS / D-Bus (`busctl`).
 - Live Karaoke Sync and Full Lyrics scrolling modes.

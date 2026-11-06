@@ -7,6 +7,8 @@ try {
   vscode = null;
 }
 const fs = require("fs");
+const http = require("http");
+const https = require("https");
 const { execFile } = require("child_process");
 const dns = require("dns");
 
@@ -14,7 +16,7 @@ if (dns.setDefaultResultOrder) {
   dns.setDefaultResultOrder("ipv4first");
 }
 
-const USER_AGENT = "OrbitLyricsBox/1.1.4";
+const USER_AGENT = "OrbitLyricsBox/1.1.5";
 // A lyrics candidate whose duration differs from the player's by more than this is a different recording.
 const DURATION_TOLERANCE_SEC = 3;
 const FETCH_TIMEOUT_MS = 8000;
@@ -23,6 +25,41 @@ const RETRY_AFTER_ERROR_MS = 15000;
 const MAX_RETRY_DELAY_MS = 120000;
 const RETRY_5XX_DELAY_MS = 400;
 const MAX_CACHE_ENTRIES = 300;
+
+// `fetch` is only available from Node 18 onwards. VS Code 1.75 ships Node 16, so the
+// extension must still work when the global is missing. This tiny Response-like shim
+// keeps `lookupLyrics` unchanged on both runtimes.
+function fetchViaHttps(url, init = {}) {
+  const target = new URL(url);
+  const lib = target.protocol === "http:" ? http : https;
+  return new Promise((resolve, reject) => {
+    const req = lib.get(target, { headers: init.headers || {} }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("error", reject);
+      res.on("end", () => {
+        const body = Buffer.concat(chunks).toString("utf-8");
+        const status = res.statusCode || 0;
+        resolve({
+          status,
+          ok: status >= 200 && status < 300,
+          json: async () => JSON.parse(body),
+          text: async () => body
+        });
+      });
+    });
+    req.on("error", reject);
+    req.setTimeout(FETCH_TIMEOUT_MS, () => req.destroy(new Error("Request timed out")));
+    const signal = init.signal;
+    if (signal && typeof signal.addEventListener === "function") {
+      const onAbort = () => req.destroy(new Error("Request aborted"));
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+}
+
+const defaultFetch = typeof fetch === "function" ? fetch : fetchViaHttps;
 
 // Only successful lookups and definitive "not found" results are cached (never network errors).
 const lyricsCache = new Map();
@@ -82,7 +119,9 @@ function isAdvertisement(title, artist, trackId = "") {
   if (/^(spotify|ads?)\b/i.test(a) && (!t || /^advertisement\b/i.test(t))) {
     return true;
   }
-  if (/\b(?:commercial|promoted|audio\s*ad)\b/i.test(combined)) {
+  // Keep this specific: a song literally titled "Commercial" or an artist named
+  // "Promoted" must not be treated as an advertisement.
+  if (/\b(?:audio\s*ad|sponsored\s+(?:content|post|track)|promoted\s+(?:content|post|track))\b/i.test(combined)) {
     return true;
   }
   return false;
@@ -266,23 +305,25 @@ function pickBestCandidate(list, criteria) {
 
 function parseLrc(lrcText) {
   if (!lrcText) return [];
-  const lines = lrcText.split("\n");
   const result = [];
-  const timeRegex = /\[(\d+):(\d+(?:\.\d+)?)\](.*)/;
+  // A single LRC line may carry several leading timestamps, e.g.
+  // "[00:10.00][01:02.50] repeated chorus". Every tag produces its own timed line.
+  const tagRe = /\[(\d+):(\d+(?:\.\d+)?)\]/g;
 
-  for (const line of lines) {
-    const match = line.match(timeRegex);
-    if (match) {
-      const minutes = parseInt(match[1], 10);
-      const seconds = parseFloat(match[2]);
-      const text = match[3].trim();
-      if (text) {
-        result.push({
-          time: minutes * 60 + seconds,
-          text: text
-        });
-      }
+  for (const line of String(lrcText).split(/\r?\n/)) {
+    tagRe.lastIndex = 0;
+    const times = [];
+    let end = 0;
+    let match;
+    while ((match = tagRe.exec(line)) !== null) {
+      if (match.index !== end) break; // timestamp tags are only meaningful at line start
+      times.push(parseInt(match[1], 10) * 60 + parseFloat(match[2]));
+      end = tagRe.lastIndex;
     }
+    if (!times.length) continue;
+    const text = line.slice(end).trim();
+    if (!text) continue;
+    for (const time of times) result.push({ time, text });
   }
   return result.sort((a, b) => a.time - b.time);
 }
@@ -318,7 +359,8 @@ function firstUsableResult(candidates) {
  *  Tier A/B: title with version tags kept  -> /api/get, then /api/search
  *  Tier C:   title without version tags    -> same, but the duration MUST match
  */
-async function lookupLyrics(track, { fetchImpl = fetch } = {}) {
+async function lookupLyrics(track, options = {}) {
+  const fetchImpl = options.fetchImpl || defaultFetch;
   const titleVariants = (track && track.titleVariants) || [];
   const artists = ((track && track.artists) || []).filter(Boolean);
   const duration = (track && track.duration) || 0;
@@ -679,28 +721,69 @@ function parseStringProperty(output) {
 
 function parseIntegerProperty(output) {
   const m = /\b[xtiun]\s+(-?\d+)/.exec(output || "");
-  return m ? parseInt(m[1], 10) : 0;
+  // null (rather than 0) so callers can tell "no Position" apart from a real 0 value.
+  return m ? parseInt(m[1], 10) : null;
+}
+
+const artDataCache = new Map();
+
+// Turns a file:// URL into an OS-native path. Windows URLs look like
+// `file:///C:/Users/x/art.jpg`; dropping the scheme leaves `/C:/...`, which fs cannot
+// open on Windows, so the extra leading slash has to go there while it is part of the
+// path on macOS/Linux. UNC URLs (`file://server/share`) become `//server/share`.
+// Kept pure so it can be unit-tested on any platform.
+function fileUrlToLocalPath(rawUrl) {
+  let rest = String(rawUrl || "").replace(/^file:\/\//i, "");
+  rest = rest.replace(/^localhost(?=\/)/i, ""); // keep the separator slash
+  if (/^\/[A-Za-z]:[\\/]/.test(rest)) {
+    rest = rest.slice(1); // file:///C:/x -> C:/x
+  } else if (rest && !/^[\\/]/.test(rest) && !/^[A-Za-z]:[\\/]/.test(rest)) {
+    rest = `//${rest}`; // file://server/share -> //server/share
+  }
+  try {
+    return decodeURIComponent(rest);
+  } catch (_) {
+    return rest;
+  }
+}
+
+// Converts a local file:// album-art URL into a data URL. The result is cached by
+// path + mtime + size so the 1-second poll does not re-read and re-encode the same
+// image on every tick.
+function fileArtToDataUrl(artUrl) {
+  try {
+    const localPath = fileUrlToLocalPath(artUrl);
+    const stat = fs.statSync(localPath);
+    const cacheKey = `${localPath}:${stat.mtimeMs}:${stat.size}`;
+    if (artDataCache.has(cacheKey)) return artDataCache.get(cacheKey);
+
+    const buf = fs.readFileSync(localPath);
+    let mime = "image/jpeg";
+    if (buf[0] === 0x89 && buf[1] === 0x50) mime = "image/png";
+    else if (buf[0] === 0x47 && buf[1] === 0x49) mime = "image/gif";
+    else if (buf[0] === 0x52 && buf[1] === 0x49) mime = "image/webp";
+    const dataUrl = `data:${mime};base64,${buf.toString("base64")}`;
+
+    if (artDataCache.size >= 16) artDataCache.clear();
+    artDataCache.set(cacheKey, dataUrl);
+    return dataUrl;
+  } catch (_) {
+    return null;
+  }
 }
 
 // Builds the player state from the raw busctl outputs (pure, unit-testable).
 function buildPlayerState(player, statusOut, positionOut, metadataOut) {
   const status = parseStringProperty(statusOut) || "Stopped";
-  const position = parseIntegerProperty(positionOut) / 1000000;
+  const positionMicros = parseIntegerProperty(positionOut);
+  // null means the player does not expose Position; the webview then keeps its local clock
+  // instead of snapping back to 0 on every poll.
+  const position = typeof positionMicros === "number" ? positionMicros / 1000000 : null;
   const meta = parseBusctlMetadata(metadataOut);
 
   let artUrl = meta.artUrl || "";
-  if (artUrl && artUrl.startsWith("file://")) {
-    try {
-      const localPath = decodeURIComponent(artUrl.replace(/^file:\/\//, ""));
-      if (fs.existsSync(localPath)) {
-        const buf = fs.readFileSync(localPath);
-        let mime = "image/jpeg";
-        if (buf[0] === 0x89 && buf[1] === 0x50) mime = "image/png";
-        else if (buf[0] === 0x47 && buf[1] === 0x49) mime = "image/gif";
-        else if (buf[0] === 0x52 && buf[1] === 0x49) mime = "image/webp";
-        artUrl = `data:${mime};base64,${buf.toString("base64")}`;
-      }
-    } catch (_) {}
+  if (artUrl && /^file:\/\//i.test(artUrl)) {
+    artUrl = fileArtToDataUrl(artUrl) || artUrl;
   }
   meta.artUrl = artUrl;
 
@@ -967,6 +1050,9 @@ async function fetchWin32MediaState() {
   win32LastFetchTime = now;
   win32InFlightPromise = (async () => {
     const psScript = `
+      # PowerShell 5.1 writes to a redirected stdout using the OEM code page by default,
+      # which turns non-ASCII titles (CJK, accents) into mojibake once Node decodes UTF-8.
+      try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
       Add-Type -AssemblyName System.Runtime.WindowsRuntime
       $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { 
         $_.Name -eq 'AsTask' -and 
@@ -1922,8 +2008,8 @@ function getWebviewContent() {
               <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>
             </button>
             <button class="ctrl-btn ctrl-play" id="playPauseBtn" title="Play / Pause">
-              <svg id="playIcon" width="13" height="13" viewBox="0 0 24 24" fill="currentColor" style="display:none;"><path d="M8 5v14l11-7z"/></svg>
-              <svg id="pauseIcon" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+              <svg id="playIcon" width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+              <svg id="pauseIcon" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" style="display:none;"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
             </button>
             <button class="ctrl-btn" id="nextBtn" title="Next">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
@@ -2051,7 +2137,8 @@ function getWebviewContent() {
     function changeOffset(delta) {
       userOffset = Math.round((userOffset + delta) * 10) / 10;
       updateOffsetDisplay();
-      currentActiveIndex = -2;
+      // Do not reset currentActiveIndex here: updateActiveLyric already removes the old
+      // highlight. Resetting it leaked an extra .active class when the index stayed the same.
       updateActiveLyric(currentPosition);
     }
 
@@ -2104,7 +2191,6 @@ function getWebviewContent() {
     offsetLabel.addEventListener("click", () => {
       userOffset = 0;
       updateOffsetDisplay();
-      currentActiveIndex = -2;
       updateActiveLyric(currentPosition);
     });
 
@@ -2210,6 +2296,8 @@ function getWebviewContent() {
         currentActiveIndex = -2;
         renderLyricsFlow();
         if (showFullLyrics) renderFullLyricsList();
+        // Re-apply the highlight immediately (important while paused, when frameLoop does not advance).
+        updateActiveLyric(currentPosition);
       }
     });
 
@@ -2222,8 +2310,12 @@ function getWebviewContent() {
       const isTrackChange = (displayTitle && trackTitle.innerText !== displayTitle);
 
       const newStatus = state.status || "Stopped";
-      const newPos = state.position || 0;
-      const newDuration = state.duration || 0;
+      // position/duration may be null (player does not expose them). In that case keep the
+      // local clock, except on a track change where it must start from zero.
+      const hasPosition = typeof state.position === "number" && isFinite(state.position);
+      const newPos = hasPosition ? state.position : (isTrackChange ? 0 : currentPosition);
+      const hasDuration = typeof state.duration === "number" && isFinite(state.duration) && state.duration > 0;
+      const newDuration = hasDuration ? state.duration : (isTrackChange ? 0 : trackDuration);
 
       playbackStatus = newStatus;
       trackDuration = newDuration;
@@ -2261,8 +2353,9 @@ function getWebviewContent() {
       trackArtist.innerText = displayArtistText;
       let friendlyName = (state.playerName || "PLAYER").toUpperCase();
       const rawP = (state.player || "").toLowerCase();
+      const playerId = (state.playerName || "").toLowerCase();
       if (rawP.includes("spotify")) friendlyName = "SPOTIFY";
-      else if (rawP.includes("music")) friendlyName = "APPLE MUSIC";
+      else if (playerId === "music" || playerId === "applemusic" || rawP.includes("applemusic")) friendlyName = "APPLE MUSIC";
       else if (rawP.includes("chromium")) friendlyName = "CHROMIUM";
       else if (rawP.includes("chrome")) friendlyName = "CHROME";
       else if (rawP.includes("firefox")) friendlyName = "FIREFOX";
@@ -2272,9 +2365,18 @@ function getWebviewContent() {
       playerSource.innerText = friendlyName + " • LINK";
       timeTotal.innerText = formatTime(trackDuration);
 
+      // Reflect the (possibly lyric-derived) duration/position immediately, even when paused.
+      timeCurrent.innerText = formatTime(currentPosition);
+      if (trackDuration > 0) {
+        const progressPct = Math.max(0, Math.min(100, (currentPosition / trackDuration) * 100));
+        progressFill.style.width = progressPct + "%";
+      } else {
+        progressFill.style.width = "0%";
+      }
+
       // Album Art
       if (state.artUrl) {
-        albumArt.src = state.artUrl;
+        if (albumArt.getAttribute("src") !== state.artUrl) albumArt.src = state.artUrl;
         albumArt.style.display = "block";
         artFallback.style.display = "none";
       } else {
@@ -2439,15 +2541,16 @@ function getWebviewContent() {
         if (trackDuration && currentPosition > trackDuration) {
           currentPosition = trackDuration;
         }
-
-        timeCurrent.innerText = formatTime(currentPosition);
-
-        if (trackDuration > 0) {
-          const pct = Math.max(0, Math.min(100, (currentPosition / trackDuration) * 100));
-          progressFill.style.width = pct + "%";
-        }
-
         updateActiveLyric(currentPosition);
+      }
+
+      // The scrubber and time label must stay in sync even while paused/stopped.
+      timeCurrent.innerText = formatTime(currentPosition);
+      if (trackDuration > 0) {
+        const pct = Math.max(0, Math.min(100, (currentPosition / trackDuration) * 100));
+        progressFill.style.width = pct + "%";
+      } else {
+        progressFill.style.width = "0%";
       }
 
       requestAnimationFrame(frameLoop);
@@ -2612,6 +2715,7 @@ module.exports = {
   parseBusctlMetadata,
   buildPlayerState,
   buildGenericPlayerState,
+  fileUrlToLocalPath,
   isAdvertisement,
   isValidPlayerName,
   getWebviewContent,

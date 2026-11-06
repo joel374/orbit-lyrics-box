@@ -13,7 +13,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const { execSync } = require("child_process");
+const { execFileSync } = require("child_process");
 
 const ROOT_DIR = path.resolve(__dirname, "..");
 const PKG_PATH = path.join(ROOT_DIR, "package.json");
@@ -37,9 +37,33 @@ if (fs.existsSync(ENV_PATH)) {
   }
 }
 
-function run(cmd, opts = {}) {
-  console.log(`\x1b[36m> ${cmd}\x1b[0m`);
-  return execSync(cmd, { cwd: ROOT_DIR, stdio: "inherit", ...opts });
+const NPM = process.platform === "win32" ? "npm.cmd" : "npm";
+const NPX = process.platform === "win32" ? "npx.cmd" : "npx";
+
+// On Windows npm/npx are .cmd shims, and since Node 18.20.2 / 20.12.2 execFile refuses
+// to launch .cmd/.bat without a shell. Running the real npm JS entrypoint through the
+// current node binary keeps things working there without re-introducing a shell (and
+// therefore without re-introducing an injection surface).
+const NODE_DIR = path.dirname(process.execPath);
+const NPM_CLI = path.join(NODE_DIR, "node_modules", "npm", "bin", "npm-cli.js");
+const NPX_CLI = path.join(NODE_DIR, "node_modules", "npm", "bin", "npx-cli.js");
+
+// Runs an executable directly (no shell), so values like version numbers or API tokens
+// can never be interpreted as shell syntax. Set log:false for secret-bearing commands.
+function run(cmd, args = [], { log = true } = {}) {
+  let file = cmd;
+  let finalArgs = args;
+  if (process.platform === "win32") {
+    const cli = cmd === NPM ? NPM_CLI : cmd === NPX ? NPX_CLI : null;
+    if (cli && fs.existsSync(cli)) {
+      file = process.execPath;
+      finalArgs = [cli, ...args];
+    }
+  }
+  if (log) console.log(`\x1b[36m> ${cmd} ${args.join(" ")}\x1b[0m`);
+  // Last resort: a .cmd/.bat shim that we could not resolve to a JS entrypoint.
+  const useShell = process.platform === "win32" && /\.(cmd|bat)$/i.test(file);
+  return execFileSync(file, finalArgs, { cwd: ROOT_DIR, stdio: "inherit", shell: useShell });
 }
 
 function bumpVersion(current, bumpType) {
@@ -71,7 +95,7 @@ async function main() {
 
   // 2. Run Tests
   console.log(`\x1b[34m[1/6] Running test suite...\x1b[0m`);
-  run("npm test");
+  run(NPM, ["test"]);
 
   // 3. Update package.json
   console.log(`\n\x1b[34m[2/6] Updating version in files...\x1b[0m`);
@@ -100,16 +124,16 @@ async function main() {
 
   // 4. Package VSIX
   console.log(`\n\x1b[34m[3/6] Packaging VSIX bundle...\x1b[0m`);
-  run("npx vsce package");
+  run(NPX, ["vsce", "package"]);
   const vsixFile = `orbit-lyrics-box-${newVersion}.vsix`;
 
   // 5. Commit and Git Tag
   console.log(`\n\x1b[34m[4/6] Committing to Git and creating Tag v${newVersion}...\x1b[0m`);
-  run(`git add -A`);
-  run(`git commit -m "release: v${newVersion}"`);
-  run(`git tag -a v${newVersion} -m "Release v${newVersion}"`);
-  run(`git push origin main`);
-  run(`git push origin v${newVersion}`);
+  run("git", ["add", "-A"]);
+  run("git", ["commit", "-m", `release: v${newVersion}`]);
+  run("git", ["tag", "-a", `v${newVersion}`, "-m", `Release v${newVersion}`]);
+  run("git", ["push", "origin", "main"]);
+  run("git", ["push", "origin", `v${newVersion}`]);
   console.log(`Pushed commit and tag v${newVersion} to GitHub!`);
 
   // 6. Optional Direct Registry Publish
@@ -120,7 +144,8 @@ async function main() {
   if (vscePat) {
     console.log(`Found VSCE_PAT! Publishing to Visual Studio Marketplace...`);
     try {
-      run(`npx vsce publish -p ${vscePat}`);
+      console.log(`\x1b[36m> ${NPX} vsce publish -p ***\x1b[0m`);
+      run(NPX, ["vsce", "publish", "-p", vscePat], { log: false });
       console.log(`\x1b[32mSuccessfully published to VS Code Marketplace!\x1b[0m`);
     } catch (e) {
       console.error(`\x1b[31mFailed to publish via vsce: ${e.message}\x1b[0m`);
@@ -134,7 +159,8 @@ async function main() {
   if (ovsxPat) {
     console.log(`Found OVSX_PAT! Publishing to Open VSX...`);
     try {
-      run(`npx ovsx publish ${vsixFile} -p ${ovsxPat}`);
+      console.log(`\x1b[36m> ${NPX} ovsx publish ${vsixFile} -p ***\x1b[0m`);
+      run(NPX, ["ovsx", "publish", vsixFile, "-p", ovsxPat], { log: false });
       console.log(`\x1b[32mSuccessfully published to Open VSX!\x1b[0m`);
     } catch (e) {
       console.error(`\x1b[31mFailed to publish via ovsx: ${e.message}\x1b[0m`);
